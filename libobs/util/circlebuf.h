@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013 Hugh Bailey <obs.jim@gmail.com>
+ * Copyright (c) 2023 Lain Bailey <lain@obsproject.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -173,7 +173,12 @@ static inline void circlebuf_push_front(struct circlebuf *cb, const void *data,
 	cb->size += size;
 	circlebuf_ensure_capacity(cb);
 
-	if (cb->start_pos < size) {
+	if (cb->size == size) {
+		cb->start_pos = 0;
+		cb->end_pos = size;
+		memcpy((uint8_t *)cb->data, data, size);
+
+	} else if (cb->start_pos < size) {
 		size_t back_size = size - cb->start_pos;
 
 		if (cb->start_pos)
@@ -216,7 +221,12 @@ static inline void circlebuf_push_front_zero(struct circlebuf *cb, size_t size)
 	cb->size += size;
 	circlebuf_ensure_capacity(cb);
 
-	if (cb->start_pos < size) {
+	if (cb->size == size) {
+		cb->start_pos = 0;
+		cb->end_pos = size;
+		memset((uint8_t *)cb->data, 0, size);
+
+	} else if (cb->start_pos < size) {
 		size_t back_size = size - cb->start_pos;
 
 		if (cb->start_pos)

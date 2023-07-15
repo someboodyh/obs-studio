@@ -1,6 +1,6 @@
 /******************************************************************************
-    Copyright (C) 2013-2015 by Hugh Bailey <obs.jim@gmail.com>
-                               Philippe Groarke <philippe.groarke@gmail.com>
+    Copyright (C) 2023 by Lain Bailey <lain@obsproject.com>
+                          Philippe Groarke <philippe.groarke@gmail.com>
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -35,6 +35,8 @@ static inline bool item_texture_enabled(const struct obs_scene_item *item);
 static void init_hotkeys(obs_scene_t *scene, obs_sceneitem_t *item,
 			 const char *name);
 
+typedef DARRAY(struct obs_scene_item *) obs_scene_item_ptr_array_t;
+
 /* NOTE: For proper mutex lock order (preventing mutual cross-locks), never
  * lock the graphics mutex inside either of the scene mutexes.
  *
@@ -57,6 +59,73 @@ static const char *obs_scene_signals[] = {
 	"void item_transform(ptr scene, ptr item)",
 	"void item_locked(ptr scene, ptr item, bool locked)",
 	NULL,
+};
+
+static const struct {
+	enum gs_blend_type src_color;
+	enum gs_blend_type src_alpha;
+	enum gs_blend_type dst_color;
+	enum gs_blend_type dst_alpha;
+	enum gs_blend_op_type op;
+} obs_blend_mode_params[] = {
+	/* clang-format off */
+	// OBS_BLEND_NORMAL
+	{
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_INVSRCALPHA,
+		GS_BLEND_INVSRCALPHA,
+		GS_BLEND_OP_ADD,
+	},
+	// OBS_BLEND_ADDITIVE
+	{
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_OP_ADD,
+	},
+	// OBS_BLEND_SUBTRACT
+	{
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_OP_REVERSE_SUBTRACT,
+	},
+	// OBS_BLEND_SCREEN
+	{
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_INVSRCCOLOR,
+		GS_BLEND_INVSRCALPHA,
+		GS_BLEND_OP_ADD
+	},
+	// OBS_BLEND_MULTIPLY
+	{
+		GS_BLEND_DSTCOLOR,
+		GS_BLEND_DSTALPHA,
+		GS_BLEND_INVSRCALPHA,
+		GS_BLEND_INVSRCALPHA,
+		GS_BLEND_OP_ADD
+	},
+	// OBS_BLEND_LIGHTEN
+	{
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_OP_MAX,
+	},
+	// OBS_BLEND_DARKEN
+	{
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_ONE,
+		GS_BLEND_OP_MIN,
+	},
+	/* clang-format on */
 };
 
 static inline void signal_item_remove(struct obs_scene_item *item)
@@ -84,7 +153,6 @@ static const char *group_getname(void *unused)
 
 static void *scene_create(obs_data_t *settings, struct obs_source *source)
 {
-	pthread_mutexattr_t attr;
 	struct obs_scene *scene = bzalloc(sizeof(struct obs_scene));
 	scene->source = source;
 
@@ -98,16 +166,12 @@ static void *scene_create(obs_data_t *settings, struct obs_source *source)
 	signal_handler_add_array(obs_source_get_signal_handler(source),
 				 obs_scene_signals);
 
-	if (pthread_mutexattr_init(&attr) != 0)
-		goto fail;
-	if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0)
-		goto fail;
-	if (pthread_mutex_init(&scene->audio_mutex, &attr) != 0) {
+	if (pthread_mutex_init_recursive(&scene->audio_mutex) != 0) {
 		blog(LOG_ERROR, "scene_create: Couldn't initialize audio "
 				"mutex");
 		goto fail;
 	}
-	if (pthread_mutex_init(&scene->video_mutex, &attr) != 0) {
+	if (pthread_mutex_init_recursive(&scene->video_mutex) != 0) {
 		blog(LOG_ERROR, "scene_create: Couldn't initialize video "
 				"mutex");
 		goto fail;
@@ -117,7 +181,6 @@ static void *scene_create(obs_data_t *settings, struct obs_source *source)
 	return scene;
 
 fail:
-	pthread_mutexattr_destroy(&attr);
 	bfree(scene);
 	return NULL;
 }
@@ -153,7 +216,7 @@ static inline void remove_without_release(struct obs_scene_item *item)
 static void remove_all_items(struct obs_scene *scene)
 {
 	struct obs_scene_item *item;
-	DARRAY(struct obs_scene_item *) items;
+	obs_scene_item_ptr_array_t items;
 
 	da_init(items);
 
@@ -332,8 +395,8 @@ static void calculate_bounds_data(struct obs_scene_item *item,
 		vec2_mulf(scale, scale, item->bounds.y / height);
 
 	} else if (bounds_type == OBS_BOUNDS_STRETCH) {
-		scale->x = item->bounds.x / (float)(*cx);
-		scale->y = item->bounds.y / (float)(*cy);
+		scale->x = copysignf(item->bounds.x / (float)(*cx), scale->x);
+		scale->y = copysignf(item->bounds.y / (float)(*cy), scale->y);
 	}
 
 	width = (float)(*cx) * scale->x;
@@ -445,18 +508,6 @@ static void update_item_transform(struct obs_scene_item *item, bool update_tex)
 	if (!update_tex)
 		return;
 
-	if (item->item_render && !item_texture_enabled(item)) {
-		obs_enter_graphics();
-		gs_texrender_destroy(item->item_render);
-		item->item_render = NULL;
-		obs_leave_graphics();
-
-	} else if (!item->item_render && item_texture_enabled(item)) {
-		obs_enter_graphics();
-		item->item_render = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-		obs_leave_graphics();
-	}
-
 	os_atomic_set_bool(&item->update_transform, false);
 }
 
@@ -478,6 +529,11 @@ static inline bool scale_filter_enabled(const struct obs_scene_item *item)
 	return item->scale_filter != OBS_SCALE_DISABLE;
 }
 
+static inline bool default_blending_enabled(const struct obs_scene_item *item)
+{
+	return item->blend_type == OBS_BLEND_NORMAL;
+}
+
 static inline bool item_is_scene(const struct obs_scene_item *item)
 {
 	return item->source && item->source->info.type == OBS_SOURCE_TYPE_SCENE;
@@ -486,10 +542,14 @@ static inline bool item_is_scene(const struct obs_scene_item *item)
 static inline bool item_texture_enabled(const struct obs_scene_item *item)
 {
 	return crop_enabled(&item->crop) || scale_filter_enabled(item) ||
+	       (item->blend_method == OBS_BLEND_METHOD_SRGB_OFF) ||
+	       !default_blending_enabled(item) ||
 	       (item_is_scene(item) && !item->is_group);
 }
 
-static void render_item_texture(struct obs_scene_item *item)
+static void render_item_texture(struct obs_scene_item *item,
+				enum gs_color_space current_space,
+				enum gs_color_space source_space)
 {
 	gs_texture_t *tex = gs_texrender_get_texture(item->item_render);
 	if (!tex) {
@@ -503,8 +563,8 @@ static void render_item_texture(struct obs_scene_item *item)
 	enum obs_scale_type type = item->scale_filter;
 	uint32_t cx = gs_texture_get_width(tex);
 	uint32_t cy = gs_texture_get_height(tex);
-	const char *tech = "Draw";
 
+	bool upscale = false;
 	if (type != OBS_SCALE_DISABLE) {
 		if (type == OBS_SCALE_POINT) {
 			gs_eparam_t *image =
@@ -514,9 +574,6 @@ static void render_item_texture(struct obs_scene_item *item)
 
 		} else if (!close_float(item->output_scale.x, 1.0f, EPSILON) ||
 			   !close_float(item->output_scale.y, 1.0f, EPSILON)) {
-			gs_eparam_t *scale_param;
-			gs_eparam_t *scale_i_param;
-
 			if (item->output_scale.x < 0.5f ||
 			    item->output_scale.y < 0.5f) {
 				effect = obs->video.bilinear_lowres_effect;
@@ -526,21 +583,22 @@ static void render_item_texture(struct obs_scene_item *item)
 				effect = obs->video.lanczos_effect;
 			} else if (type == OBS_SCALE_AREA) {
 				effect = obs->video.area_effect;
-				if ((item->output_scale.x >= 1.0f) &&
-				    (item->output_scale.y >= 1.0f))
-					tech = "DrawUpscale";
+				upscale = (item->output_scale.x >= 1.0f) &&
+					  (item->output_scale.y >= 1.0f);
 			}
 
-			scale_param = gs_effect_get_param_by_name(
-				effect, "base_dimension");
+			gs_eparam_t *const scale_param =
+				gs_effect_get_param_by_name(effect,
+							    "base_dimension");
 			if (scale_param) {
 				struct vec2 base_res = {(float)cx, (float)cy};
 
 				gs_effect_set_vec2(scale_param, &base_res);
 			}
 
-			scale_i_param = gs_effect_get_param_by_name(
-				effect, "base_dimension_i");
+			gs_eparam_t *const scale_i_param =
+				gs_effect_get_param_by_name(effect,
+							    "base_dimension_i");
 			if (scale_i_param) {
 				struct vec2 base_res_i = {1.0f / (float)cx,
 							  1.0f / (float)cy};
@@ -550,10 +608,95 @@ static void render_item_texture(struct obs_scene_item *item)
 		}
 	}
 
-	gs_blend_state_push();
-	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+	float multiplier = 1.f;
 
-	while (gs_effect_loop(effect, tech))
+	if (current_space == GS_CS_709_SCRGB) {
+		switch (source_space) {
+		case GS_CS_SRGB:
+		case GS_CS_SRGB_16F:
+		case GS_CS_709_EXTENDED:
+			multiplier = obs_get_video_sdr_white_level() / 80.f;
+			break;
+		case GS_CS_709_SCRGB:
+			break;
+		}
+	}
+
+	if (source_space == GS_CS_709_SCRGB) {
+		switch (current_space) {
+		case GS_CS_SRGB:
+		case GS_CS_SRGB_16F:
+		case GS_CS_709_EXTENDED:
+			multiplier = 80.f / obs_get_video_sdr_white_level();
+			break;
+		case GS_CS_709_SCRGB:
+			break;
+		}
+	}
+
+	const char *tech_name = "Draw";
+	if (upscale) {
+		tech_name = "DrawUpscale";
+		switch (source_space) {
+		case GS_CS_SRGB:
+		case GS_CS_SRGB_16F:
+			if (current_space == GS_CS_709_SCRGB)
+				tech_name = "DrawUpscaleMultiply";
+			break;
+		case GS_CS_709_EXTENDED:
+			if (current_space == GS_CS_SRGB ||
+			    current_space == GS_CS_SRGB_16F)
+				tech_name = "DrawUpscaleTonemap";
+			else if (current_space == GS_CS_709_SCRGB)
+				tech_name = "DrawUpscaleMultiply";
+			break;
+		case GS_CS_709_SCRGB:
+			if (current_space == GS_CS_SRGB ||
+			    current_space == GS_CS_SRGB_16F)
+				tech_name = "DrawUpscaleMultiplyTonemap";
+			else if (current_space == GS_CS_709_EXTENDED)
+				tech_name = "DrawUpscaleMultiply";
+			break;
+		}
+	} else {
+		switch (source_space) {
+		case GS_CS_SRGB:
+		case GS_CS_SRGB_16F:
+			if (current_space == GS_CS_709_SCRGB)
+				tech_name = "DrawMultiply";
+			break;
+		case GS_CS_709_EXTENDED:
+			if (current_space == GS_CS_SRGB ||
+			    current_space == GS_CS_SRGB_16F)
+				tech_name = "DrawTonemap";
+			else if (current_space == GS_CS_709_SCRGB)
+				tech_name = "DrawMultiply";
+			break;
+		case GS_CS_709_SCRGB:
+			if (current_space == GS_CS_SRGB ||
+			    current_space == GS_CS_SRGB_16F)
+				tech_name = "DrawMultiplyTonemap";
+			else if (current_space == GS_CS_709_EXTENDED)
+				tech_name = "DrawMultiply";
+			break;
+		}
+	}
+
+	gs_eparam_t *const multiplier_param =
+		gs_effect_get_param_by_name(effect, "multiplier");
+	if (multiplier_param)
+		gs_effect_set_float(multiplier_param, multiplier);
+
+	gs_blend_state_push();
+
+	gs_blend_function_separate(
+		obs_blend_mode_params[item->blend_type].src_color,
+		obs_blend_mode_params[item->blend_type].dst_color,
+		obs_blend_mode_params[item->blend_type].src_alpha,
+		obs_blend_mode_params[item->blend_type].dst_alpha);
+	gs_blend_op(obs_blend_mode_params[item->blend_type].op);
+
+	while (gs_effect_loop(effect, tech_name))
 		obs_source_draw(tex, 0, 0, 0, 0, 0);
 
 	gs_blend_state_pop();
@@ -561,10 +704,44 @@ static void render_item_texture(struct obs_scene_item *item)
 	GS_DEBUG_MARKER_END();
 }
 
+static bool are_texcoords_centered(struct matrix4 *m)
+{
+	static const struct matrix4 identity = {
+		{1.0f, 0.0f, 0.0f, 0.0f},
+		{0.0f, 1.0f, 0.0f, 0.0f},
+		{0.0f, 0.0f, 1.0f, 0.0f},
+		{0.0f, 0.0f, 0.0f, 1.0f},
+	};
+	struct matrix4 copy = identity;
+	copy.t.x = floorf(m->t.x);
+	copy.t.y = floorf(m->t.y);
+	return memcmp(m, &copy, sizeof(*m)) == 0;
+}
+
 static inline void render_item(struct obs_scene_item *item)
 {
 	GS_DEBUG_MARKER_BEGIN_FORMAT(GS_DEBUG_COLOR_ITEM, "Item: %s",
 				     obs_source_get_name(item->source));
+
+	const bool use_texrender = item_texture_enabled(item);
+
+	obs_source_t *const source = item->source;
+	const enum gs_color_space current_space = gs_get_color_space();
+	const enum gs_color_space source_space =
+		obs_source_get_color_space(source, 1, &current_space);
+	const enum gs_color_format format =
+		gs_get_format_from_space(source_space);
+
+	if (item->item_render &&
+	    (!use_texrender ||
+	     (gs_texrender_get_format(item->item_render) != format))) {
+		gs_texrender_destroy(item->item_render);
+		item->item_render = NULL;
+	}
+
+	if (!item->item_render && use_texrender) {
+		item->item_render = gs_texrender_create(format, GS_ZS_NONE);
+	}
 
 	if (item->item_render) {
 		uint32_t width = obs_source_get_width(item->source);
@@ -577,7 +754,9 @@ static inline void render_item(struct obs_scene_item *item)
 		uint32_t cx = calc_cx(item, width);
 		uint32_t cy = calc_cy(item, height);
 
-		if (cx && cy && gs_texrender_begin(item->item_render, cx, cy)) {
+		if (cx && cy &&
+		    gs_texrender_begin_with_color_space(item->item_render, cx,
+							cy, source_space)) {
 			float cx_scale = (float)width / (float)cx;
 			float cy_scale = (float)height / (float)cy;
 			struct vec4 clear_color;
@@ -610,18 +789,25 @@ static inline void render_item(struct obs_scene_item *item)
 							cx, cy);
 				obs_source_video_render(item->hide_transition);
 			} else {
+				obs_source_set_texcoords_centered(item->source,
+								  true);
 				obs_source_video_render(item->source);
+				obs_source_set_texcoords_centered(item->source,
+								  false);
 			}
 
 			gs_texrender_end(item->item_render);
 		}
 	}
 
-	const bool previous = gs_set_linear_srgb(true);
+	const bool linear_srgb =
+		!item->item_render ||
+		(item->blend_method != OBS_BLEND_METHOD_SRGB_OFF);
+	const bool previous = gs_set_linear_srgb(linear_srgb);
 	gs_matrix_push();
 	gs_matrix_mul(&item->draw_transform);
 	if (item->item_render) {
-		render_item_texture(item);
+		render_item_texture(item, current_space, source_space);
 	} else if (item->user_visible &&
 		   transition_active(item->show_transition)) {
 		const int cx = obs_source_get_width(item->source);
@@ -635,7 +821,11 @@ static inline void render_item(struct obs_scene_item *item)
 		obs_transition_set_size(item->hide_transition, cx, cy);
 		obs_source_video_render(item->hide_transition);
 	} else {
+		const bool centered =
+			are_texcoords_centered(&item->draw_transform);
+		obs_source_set_texcoords_centered(item->source, centered);
 		obs_source_video_render(item->source);
+		obs_source_set_texcoords_centered(item->source, false);
 	}
 	gs_matrix_pop();
 	gs_set_linear_srgb(previous);
@@ -664,7 +854,7 @@ static void scene_video_tick(void *data, float seconds)
 /* assumes video lock */
 static void
 update_transforms_and_prune_sources(obs_scene_t *scene,
-				    struct darray *remove_items,
+				    obs_scene_item_ptr_array_t *remove_items,
 				    obs_sceneitem_t *group_sceneitem)
 {
 	struct obs_scene_item *item = scene->first_item;
@@ -678,8 +868,7 @@ update_transforms_and_prune_sources(obs_scene_t *scene,
 			item = item->next;
 
 			remove_without_release(del_item);
-			darray_push_back(sizeof(struct obs_scene_item *),
-					 remove_items, &del_item);
+			da_push_back(*remove_items, &del_item);
 			rebuild_group = true;
 			continue;
 		}
@@ -709,7 +898,7 @@ update_transforms_and_prune_sources(obs_scene_t *scene,
 
 static void scene_video_render(void *data, gs_effect_t *effect)
 {
-	DARRAY(struct obs_scene_item *) remove_items;
+	obs_scene_item_ptr_array_t remove_items;
 	struct obs_scene *scene = data;
 	struct obs_scene_item *item;
 
@@ -718,8 +907,7 @@ static void scene_video_render(void *data, gs_effect_t *effect)
 	video_lock(scene);
 
 	if (!scene->is_group) {
-		update_transforms_and_prune_sources(scene, &remove_items.da,
-						    NULL);
+		update_transforms_and_prune_sources(scene, &remove_items, NULL);
 	}
 
 	gs_blend_state_push();
@@ -771,8 +959,11 @@ static void scene_load(void *data, obs_data_t *settings);
 static void scene_load_item(struct obs_scene *scene, obs_data_t *item_data)
 {
 	const char *name = obs_data_get_string(item_data, "name");
-	obs_source_t *source;
+	const char *src_uuid = obs_data_get_string(item_data, "source_uuid");
+	obs_source_t *source = NULL;
 	const char *scale_filter_str;
+	const char *blend_method_str;
+	const char *blend_str;
 	struct obs_scene_item *item;
 	bool visible;
 	bool lock;
@@ -780,7 +971,13 @@ static void scene_load_item(struct obs_scene *scene, obs_data_t *item_data)
 	if (obs_data_get_bool(item_data, "group_item_backup"))
 		return;
 
-	source = obs_get_source_by_name(name);
+	if (src_uuid && strlen(src_uuid) == UUID_STR_LENGTH)
+		source = obs_get_source_by_uuid(src_uuid);
+
+	/* Fall back to name if UUID was not found or is not set. */
+	if (!source)
+		source = obs_get_source_by_name(name);
+
 	if (!source) {
 		blog(LOG_WARNING,
 		     "[scene_load_item] Source %s not "
@@ -852,6 +1049,32 @@ static void scene_load_item(struct obs_scene *scene, obs_data_t *item_data)
 			item->scale_filter = OBS_SCALE_AREA;
 	}
 
+	blend_method_str = obs_data_get_string(item_data, "blend_method");
+	item->blend_method = OBS_BLEND_METHOD_DEFAULT;
+
+	if (blend_method_str) {
+		if (astrcmpi(blend_method_str, "srgb_off") == 0)
+			item->blend_method = OBS_BLEND_METHOD_SRGB_OFF;
+	}
+
+	blend_str = obs_data_get_string(item_data, "blend_type");
+	item->blend_type = OBS_BLEND_NORMAL;
+
+	if (blend_str) {
+		if (astrcmpi(blend_str, "additive") == 0)
+			item->blend_type = OBS_BLEND_ADDITIVE;
+		else if (astrcmpi(blend_str, "subtract") == 0)
+			item->blend_type = OBS_BLEND_SUBTRACT;
+		else if (astrcmpi(blend_str, "screen") == 0)
+			item->blend_type = OBS_BLEND_SCREEN;
+		else if (astrcmpi(blend_str, "multiply") == 0)
+			item->blend_type = OBS_BLEND_MULTIPLY;
+		else if (astrcmpi(blend_str, "lighten") == 0)
+			item->blend_type = OBS_BLEND_LIGHTEN;
+		else if (astrcmpi(blend_str, "darken") == 0)
+			item->blend_type = OBS_BLEND_DARKEN;
+	}
+
 	obs_data_t *show_data = obs_data_get_obj(item_data, "show_transition");
 	if (show_data) {
 		obs_sceneitem_transition_load(item, show_data, true);
@@ -862,18 +1085,6 @@ static void scene_load_item(struct obs_scene *scene, obs_data_t *item_data)
 	if (hide_data) {
 		obs_sceneitem_transition_load(item, hide_data, false);
 		obs_data_release(hide_data);
-	}
-
-	if (item->item_render && !item_texture_enabled(item)) {
-		obs_enter_graphics();
-		gs_texrender_destroy(item->item_render);
-		item->item_render = NULL;
-		obs_leave_graphics();
-
-	} else if (!item->item_render && item_texture_enabled(item)) {
-		obs_enter_graphics();
-		item->item_render = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-		obs_leave_graphics();
 	}
 
 	obs_source_release(source);
@@ -889,6 +1100,12 @@ static void scene_load(void *data, obs_data_t *settings)
 
 	remove_all_items(scene);
 
+	if (obs_data_get_bool(settings, "custom_size")) {
+		scene->cx = (uint32_t)obs_data_get_int(settings, "cx");
+		scene->cy = (uint32_t)obs_data_get_int(settings, "cy");
+		scene->custom_size = true;
+	}
+
 	if (!items)
 		return;
 
@@ -903,12 +1120,6 @@ static void scene_load(void *data, obs_data_t *settings)
 	if (obs_data_has_user_value(settings, "id_counter"))
 		scene->id_counter = obs_data_get_int(settings, "id_counter");
 
-	if (obs_data_get_bool(settings, "custom_size")) {
-		scene->cx = (uint32_t)obs_data_get_int(settings, "cx");
-		scene->cy = (uint32_t)obs_data_get_int(settings, "cy");
-		scene->custom_size = true;
-	}
-
 	obs_data_array_release(items);
 }
 
@@ -920,7 +1131,10 @@ static void scene_save_item(obs_data_array_t *array,
 {
 	obs_data_t *item_data = obs_data_create();
 	const char *name = obs_source_get_name(item->source);
+	const char *src_uuid = obs_source_get_uuid(item->source);
 	const char *scale_filter;
+	const char *blend_method;
+	const char *blend_type;
 	struct vec2 pos = item->pos;
 	struct vec2 scale = item->scale;
 	float rot = item->rot;
@@ -930,6 +1144,7 @@ static void scene_save_item(obs_data_array_t *array,
 	}
 
 	obs_data_set_string(item_data, "name", name);
+	obs_data_set_string(item_data, "source_uuid", src_uuid);
 	obs_data_set_bool(item_data, "visible", item->user_visible);
 	obs_data_set_bool(item_data, "locked", item->locked);
 	obs_data_set_double(item_data, "rot", rot);
@@ -979,6 +1194,32 @@ static void scene_save_item(obs_data_array_t *array,
 
 	obs_data_set_string(item_data, "scale_filter", scale_filter);
 
+	if (item->blend_method == OBS_BLEND_METHOD_SRGB_OFF)
+		blend_method = "srgb_off";
+	else
+		blend_method = "default";
+
+	obs_data_set_string(item_data, "blend_method", blend_method);
+
+	if (item->blend_type == OBS_BLEND_NORMAL)
+		blend_type = "normal";
+	else if (item->blend_type == OBS_BLEND_ADDITIVE)
+		blend_type = "additive";
+	else if (item->blend_type == OBS_BLEND_SUBTRACT)
+		blend_type = "subtract";
+	else if (item->blend_type == OBS_BLEND_SCREEN)
+		blend_type = "screen";
+	else if (item->blend_type == OBS_BLEND_MULTIPLY)
+		blend_type = "multiply";
+	else if (item->blend_type == OBS_BLEND_LIGHTEN)
+		blend_type = "lighten";
+	else if (item->blend_type == OBS_BLEND_DARKEN)
+		blend_type = "darken";
+	else
+		blend_type = "normal";
+
+	obs_data_set_string(item_data, "blend_type", blend_type);
+
 	obs_data_t *show_data = obs_sceneitem_transition_save(item, true);
 	obs_data_set_obj(item_data, "show_transition", show_data);
 	obs_data_release(show_data);
@@ -1023,13 +1264,21 @@ static void scene_save(void *data, obs_data_t *settings)
 static uint32_t scene_getwidth(void *data)
 {
 	obs_scene_t *scene = data;
-	return scene->custom_size ? scene->cx : obs->video.base_width;
+	if (scene->custom_size)
+		return scene->cx;
+	if (obs->video.main_mix)
+		return obs->video.main_mix->ovi.base_width;
+	return 0;
 }
 
 static uint32_t scene_getheight(void *data)
 {
 	obs_scene_t *scene = data;
-	return scene->custom_size ? scene->cy : obs->video.base_height;
+	if (scene->custom_size)
+		return scene->cy;
+	if (obs->video.main_mix)
+		return obs->video.main_mix->ovi.base_height;
+	return 0;
 }
 
 static void apply_scene_item_audio_actions(struct obs_scene_item *item,
@@ -1123,9 +1372,9 @@ static void process_all_audio_actions(struct obs_scene_item *item,
 static void mix_audio_with_buf(float *p_out, float *p_in, float *buf_in,
 			       size_t pos, size_t count)
 {
-	register float *out = p_out;
-	register float *buf = buf_in + pos;
-	register float *in = p_in + pos;
+	register float *out = p_out + pos;
+	register float *buf = buf_in;
+	register float *in = p_in;
 	register float *end = in + count;
 
 	while (in < end)
@@ -1135,8 +1384,8 @@ static void mix_audio_with_buf(float *p_out, float *p_in, float *buf_in,
 static inline void mix_audio(float *p_out, float *p_in, size_t pos,
 			     size_t count)
 {
-	register float *out = p_out;
-	register float *in = p_in + pos;
+	register float *out = p_out + pos;
+	register float *in = p_in;
 	register float *end = in + count;
 
 	while (in < end)
@@ -1222,6 +1471,12 @@ static bool scene_audio_render(void *data, uint64_t *ts_out,
 
 		pos = (size_t)ns_to_audio_frames(sample_rate,
 						 source_ts - timestamp);
+
+		if (pos >= AUDIO_OUTPUT_FRAMES) {
+			item = item->next;
+			continue;
+		}
+
 		count = AUDIO_OUTPUT_FRAMES - pos;
 
 		if (!apply_buf && !item->visible &&
@@ -1257,6 +1512,25 @@ static bool scene_audio_render(void *data, uint64_t *ts_out,
 	return true;
 }
 
+enum gs_color_space
+scene_video_get_color_space(void *data, size_t count,
+			    const enum gs_color_space *preferred_spaces)
+{
+	UNUSED_PARAMETER(data);
+	UNUSED_PARAMETER(count);
+	UNUSED_PARAMETER(preferred_spaces);
+
+	enum gs_color_space space = GS_CS_SRGB;
+	struct obs_video_info ovi;
+	if (obs_get_video_info(&ovi)) {
+		if (ovi.colorspace == VIDEO_CS_2100_PQ ||
+		    ovi.colorspace == VIDEO_CS_2100_HLG)
+			space = GS_CS_709_EXTENDED;
+	}
+
+	return space;
+}
+
 const struct obs_source_info scene_info = {
 	.id = "scene",
 	.type = OBS_SOURCE_TYPE_SCENE,
@@ -1274,7 +1548,9 @@ const struct obs_source_info scene_info = {
 	.load = scene_load,
 	.save = scene_save,
 	.enum_active_sources = scene_enum_active_sources,
-	.enum_all_sources = scene_enum_all_sources};
+	.enum_all_sources = scene_enum_all_sources,
+	.video_get_color_space = scene_video_get_color_space,
+};
 
 const struct obs_source_info group_info = {
 	.id = "group",
@@ -1292,7 +1568,9 @@ const struct obs_source_info group_info = {
 	.load = scene_load,
 	.save = scene_save,
 	.enum_active_sources = scene_enum_active_sources,
-	.enum_all_sources = scene_enum_all_sources};
+	.enum_all_sources = scene_enum_all_sources,
+	.video_get_color_space = scene_video_get_color_space,
+};
 
 static inline obs_scene_t *create_id(const char *id, const char *name)
 {
@@ -1325,25 +1603,22 @@ static obs_source_t *get_child_at_idx(obs_scene_t *scene, size_t idx)
 	return item ? item->source : NULL;
 }
 
-static inline obs_source_t *dup_child(struct darray *array, size_t idx,
-				      obs_scene_t *new_scene, bool private)
+static inline obs_source_t *dup_child(obs_scene_item_ptr_array_t *old_items,
+				      size_t idx, obs_scene_t *new_scene,
+				      bool private)
 {
-	DARRAY(struct obs_scene_item *) old_items;
 	obs_source_t *source;
 
-	old_items.da = *array;
-
-	source = old_items.array[idx]->source;
+	source = old_items->array[idx]->source;
 
 	/* if the old item is referenced more than once in the old scene,
 	 * make sure they're referenced similarly in the new scene to reduce
 	 * load times */
 	for (size_t i = 0; i < idx; i++) {
-		struct obs_scene_item *item = old_items.array[i];
+		struct obs_scene_item *item = old_items->array[i];
 		if (item->source == source) {
 			source = get_child_at_idx(new_scene, i);
-			obs_source_addref(source);
-			return source;
+			return obs_source_get_ref(source);
 		}
 	}
 
@@ -1353,15 +1628,13 @@ static inline obs_source_t *dup_child(struct darray *array, size_t idx,
 
 static inline obs_source_t *new_ref(obs_source_t *source)
 {
-	obs_source_addref(source);
-	return source;
+	return obs_source_get_ref(source);
 }
 
 static inline void duplicate_item_data(struct obs_scene_item *dst,
 				       struct obs_scene_item *src,
 				       bool defer_texture_update,
-				       bool duplicate_hotkeys,
-				       bool duplicate_private_data)
+				       bool duplicate_hotkeys)
 {
 	struct obs_scene *dst_scene = dst->parent;
 
@@ -1377,6 +1650,8 @@ static inline void duplicate_item_data(struct obs_scene_item *dst,
 	dst->last_height = src->last_height;
 	dst->output_scale = src->output_scale;
 	dst->scale_filter = src->scale_filter;
+	dst->blend_method = src->blend_method;
+	dst->blend_type = src->blend_type;
 	dst->box_transform = src->box_transform;
 	dst->box_scale = src->box_scale;
 	dst->draw_transform = src->draw_transform;
@@ -1388,14 +1663,14 @@ static inline void duplicate_item_data(struct obs_scene_item *dst,
 		obs_source_t *transition = obs_source_duplicate(
 			src->show_transition,
 			obs_source_get_name(src->show_transition), true);
-		obs_sceneitem_set_show_transition(dst, transition);
+		obs_sceneitem_set_transition(dst, true, transition);
 		obs_source_release(transition);
 	}
 	if (src->hide_transition) {
 		obs_source_t *transition = obs_source_duplicate(
 			src->hide_transition,
 			obs_source_get_name(src->hide_transition), true);
-		obs_sceneitem_set_hide_transition(dst, transition);
+		obs_sceneitem_set_transition(dst, false, transition);
 		obs_source_release(transition);
 	}
 	dst->show_transition_duration = src->show_transition_duration;
@@ -1417,18 +1692,9 @@ static inline void duplicate_item_data(struct obs_scene_item *dst,
 
 	if (defer_texture_update) {
 		os_atomic_set_bool(&dst->update_transform, true);
-	} else {
-		if (!dst->item_render && item_texture_enabled(dst)) {
-			obs_enter_graphics();
-			dst->item_render =
-				gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-			obs_leave_graphics();
-		}
 	}
 
-	if (duplicate_private_data) {
-		obs_data_apply(dst->private_settings, src->private_settings);
-	}
+	obs_data_apply(dst->private_settings, src->private_settings);
 }
 
 obs_scene_t *obs_scene_duplicate(obs_scene_t *scene, const char *name,
@@ -1436,7 +1702,7 @@ obs_scene_t *obs_scene_duplicate(obs_scene_t *scene, const char *name,
 {
 	bool make_unique = ((int)type & (1 << 0)) != 0;
 	bool make_private = ((int)type & (1 << 1)) != 0;
-	DARRAY(struct obs_scene_item *) items;
+	obs_scene_item_ptr_array_t items;
 	struct obs_scene *new_scene;
 	struct obs_scene_item *item;
 	struct obs_source *source;
@@ -1476,9 +1742,9 @@ obs_scene_t *obs_scene_duplicate(obs_scene_t *scene, const char *name,
 
 	for (size_t i = 0; i < items.num; i++) {
 		item = items.array[i];
-		source = make_unique ? dup_child(&items.da, i, new_scene,
-						 make_private)
-				     : new_ref(item->source);
+		source = make_unique
+				 ? dup_child(&items, i, new_scene, make_private)
+				 : new_ref(item->source);
 
 		if (source) {
 			struct obs_scene_item *new_item =
@@ -1489,8 +1755,7 @@ obs_scene_t *obs_scene_duplicate(obs_scene_t *scene, const char *name,
 				continue;
 			}
 
-			duplicate_item_data(new_item, item, false, false,
-					    false);
+			duplicate_item_data(new_item, item, false, false);
 
 			obs_source_release(source);
 		}
@@ -1510,6 +1775,15 @@ void obs_scene_addref(obs_scene_t *scene)
 {
 	if (scene)
 		obs_source_addref(scene->source);
+}
+
+obs_scene_t *obs_scene_get_ref(obs_scene_t *scene)
+{
+	if (!scene)
+		return NULL;
+	if (obs_source_get_ref(scene->source) != NULL)
+		return scene;
+	return NULL;
 }
 
 void obs_scene_release(obs_scene_t *scene)
@@ -1807,21 +2081,27 @@ static obs_sceneitem_t *obs_scene_add_internal(obs_scene_t *scene,
 	if (!scene)
 		return NULL;
 
+	source = obs_source_get_ref(source);
 	if (!source) {
 		blog(LOG_ERROR, "Tried to add a NULL source to a scene");
 		return NULL;
 	}
 
+	if (source->removed) {
+		blog(LOG_WARNING, "Tried to add a removed source to a scene");
+		goto release_source_and_fail;
+	}
+
 	if (pthread_mutex_init(&mutex, NULL) != 0) {
 		blog(LOG_WARNING, "Failed to create scene item mutex");
-		return NULL;
+		goto release_source_and_fail;
 	}
 
 	if (!obs_source_add_active_child(scene->source, source)) {
 		blog(LOG_WARNING, "Failed to add source to scene due to "
 				  "infinite source recursion");
 		pthread_mutex_destroy(&mutex);
-		return NULL;
+		goto release_source_and_fail;
 	}
 
 	item = bzalloc(sizeof(struct obs_scene_item));
@@ -1841,19 +2121,11 @@ static obs_sceneitem_t *obs_scene_add_internal(obs_scene_t *scene,
 	matrix4_identity(&item->draw_transform);
 	matrix4_identity(&item->box_transform);
 
-	obs_source_addref(source);
-
 	if (source_has_audio(source)) {
 		item->visible = false;
 		da_push_back(item->audio_actions, &action);
 	} else {
 		item->visible = true;
-	}
-
-	if (item_texture_enabled(item)) {
-		obs_enter_graphics();
-		item->item_render = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-		obs_leave_graphics();
 	}
 
 	full_lock(scene);
@@ -1887,6 +2159,10 @@ static obs_sceneitem_t *obs_scene_add_internal(obs_scene_t *scene,
 			       sceneitem_renamed, item);
 
 	return item;
+
+release_source_and_fail:
+	obs_source_release(source);
+	return NULL;
 }
 
 obs_sceneitem_t *obs_scene_add(obs_scene_t *scene, obs_source_t *source)
@@ -1975,8 +2251,8 @@ void obs_sceneitem_remove(obs_sceneitem_t *item)
 
 	full_unlock(scene);
 
-	obs_sceneitem_set_show_transition(item, NULL);
-	obs_sceneitem_set_hide_transition(item, NULL);
+	obs_sceneitem_set_transition(item, true, NULL);
+	obs_sceneitem_set_transition(item, false, NULL);
 
 	obs_sceneitem_release(item);
 }
@@ -2085,7 +2361,6 @@ bool save_transform_states(obs_scene_t *scene, obs_sceneitem_t *item,
 		obs_data_array_release(nids);
 	}
 
-	UNUSED_PARAMETER(scene);
 	return true;
 }
 
@@ -2101,6 +2376,8 @@ obs_data_t *obs_scene_save_transform_states(obs_scene_t *scene, bool all_items)
 
 	obs_data_set_string(temp, "scene_name",
 			    obs_source_get_name(obs_scene_get_source(scene)));
+	obs_data_set_string(temp, "scene_uuid",
+			    obs_source_get_uuid(obs_scene_get_source(scene)));
 	obs_data_set_bool(temp, "is_group", false);
 
 	obs_scene_enum_items(scene, save_transform_states, (void *)&pass);
@@ -2280,9 +2557,11 @@ void obs_sceneitem_set_order(obs_sceneitem_t *item,
 		return;
 
 	struct obs_scene_item *next, *prev;
-	struct obs_scene *scene = item->parent;
+	struct obs_scene *scene = obs_scene_get_ref(item->parent);
 
-	obs_scene_addref(scene);
+	if (!scene)
+		return;
+
 	full_lock(scene);
 
 	next = item->next;
@@ -2340,10 +2619,12 @@ void obs_sceneitem_set_order_position(obs_sceneitem_t *item, int position)
 	if (!item)
 		return;
 
-	struct obs_scene *scene = item->parent;
+	struct obs_scene *scene = obs_scene_get_ref(item->parent);
 	struct obs_scene_item *next;
 
-	obs_scene_addref(scene);
+	if (!scene)
+		return;
+
 	full_lock(scene);
 
 	detach_sceneitem(item);
@@ -2451,7 +2732,9 @@ void obs_sceneitem_set_info(obs_sceneitem_t *item,
 	if (item && info) {
 		item->pos = info->pos;
 		item->rot = info->rot;
-		item->scale = info->scale;
+		if (isfinite(info->scale.x) && isfinite(info->scale.y)) {
+			item->scale = info->scale;
+		}
 		item->align = info->alignment;
 		item->bounds_type = info->bounds_type;
 		item->bounds_align = info->bounds_alignment;
@@ -2613,7 +2896,10 @@ bool obs_scene_reorder_items(obs_scene_t *scene,
 	if (!scene || !item_order_size)
 		return false;
 
-	obs_scene_addref(scene);
+	scene = obs_scene_get_ref(scene);
+	if (!scene)
+		return false;
+
 	full_lock(scene);
 
 	bool order_matches = true;
@@ -2651,7 +2937,10 @@ void obs_scene_atomic_update(obs_scene_t *scene,
 	if (!scene)
 		return;
 
-	obs_scene_addref(scene);
+	scene = obs_scene_get_ref(scene);
+	if (!scene)
+		return;
+
 	full_lock(scene);
 	func(data, scene);
 	full_unlock(scene);
@@ -2716,6 +3005,41 @@ enum obs_scale_type obs_sceneitem_get_scale_filter(obs_sceneitem_t *item)
 	return obs_ptr_valid(item, "obs_sceneitem_get_scale_filter")
 		       ? item->scale_filter
 		       : OBS_SCALE_DISABLE;
+}
+
+void obs_sceneitem_set_blending_method(obs_sceneitem_t *item,
+				       enum obs_blending_method method)
+{
+	if (!obs_ptr_valid(item, "obs_sceneitem_set_blending_method"))
+		return;
+
+	item->blend_method = method;
+}
+
+enum obs_blending_method
+obs_sceneitem_get_blending_method(obs_sceneitem_t *item)
+{
+	return obs_ptr_valid(item, "obs_sceneitem_get_blending_method")
+		       ? item->blend_method
+		       : OBS_BLEND_METHOD_DEFAULT;
+}
+
+void obs_sceneitem_set_blending_mode(obs_sceneitem_t *item,
+				     enum obs_blending_type type)
+{
+	if (!obs_ptr_valid(item, "obs_sceneitem_set_blending_mode"))
+		return;
+
+	item->blend_type = type;
+
+	os_atomic_set_bool(&item->update_transform, true);
+}
+
+enum obs_blending_type obs_sceneitem_get_blending_mode(obs_sceneitem_t *item)
+{
+	return obs_ptr_valid(item, "obs_sceneitem_get_blending_mode")
+		       ? item->blend_type
+		       : OBS_BLEND_NORMAL;
 }
 
 void obs_sceneitem_defer_update_begin(obs_sceneitem_t *item)
@@ -2977,10 +3301,10 @@ obs_sceneitem_t *obs_scene_insert_group(obs_scene_t *scene, const char *name,
 	obs_sceneitem_t *item =
 		obs_scene_add_internal(scene, sub_scene->source, last_item);
 
-	obs_scene_release(sub_scene);
-
-	if (!items || !count)
+	if (!items || !count) {
+		obs_scene_release(sub_scene);
 		return item;
+	}
 
 	/* ------------------------- */
 
@@ -3010,8 +3334,18 @@ obs_sceneitem_t *obs_scene_insert_group(obs_scene_t *scene, const char *name,
 	full_unlock(sub_scene);
 	full_unlock(scene);
 
+	struct calldata params;
+	uint8_t stack[128];
+
+	calldata_init_fixed(&params, stack, sizeof(stack));
+	calldata_set_ptr(&params, "scene", scene);
+	calldata_set_ptr(&params, "item", item);
+	signal_handler_signal(scene->source->context.signals, "item_add",
+			      &params);
+
 	/* ------------------------- */
 
+	obs_scene_release(sub_scene);
 	return item;
 }
 
@@ -3075,6 +3409,8 @@ void obs_sceneitem_group_ungroup(obs_sceneitem_t *item)
 	obs_sceneitem_t *first;
 	obs_sceneitem_t *last;
 
+	signal_item_remove(item);
+
 	full_lock(scene);
 
 	/* ------------------------- */
@@ -3087,7 +3423,7 @@ void obs_sceneitem_group_ungroup(obs_sceneitem_t *item)
 
 		remove_group_transform(item, last);
 		dst = obs_scene_add_internal(scene, last->source, insert_after);
-		duplicate_item_data(dst, last, true, true, true);
+		duplicate_item_data(dst, last, true, true);
 		apply_group_transform(last, item);
 
 		if (!last->next)
@@ -3189,7 +3525,9 @@ build_current_order_info(obs_scene_t *scene,
 
 	obs_sceneitem_t *item = scene->first_item;
 	while (item) {
-		da_push_back(items, &item);
+		struct obs_sceneitem_order_info info = {0};
+		info.item = item;
+		da_push_back(items, &info);
 
 		if (item->is_group) {
 			obs_scene_t *sub_scene = item->source->context.data;
@@ -3199,7 +3537,9 @@ build_current_order_info(obs_scene_t *scene,
 			obs_sceneitem_t *sub_item = sub_scene->first_item;
 
 			while (sub_item) {
-				da_push_back(items, &item);
+				info.group = item;
+				info.item = sub_item;
+				da_push_back(items, &info);
 
 				sub_item = sub_item->next;
 			}
@@ -3265,7 +3605,10 @@ bool obs_scene_reorder_items2(obs_scene_t *scene,
 	if (!scene || !item_order_size || !item_order)
 		return false;
 
-	obs_scene_addref(scene);
+	scene = obs_scene_get_ref(scene);
+	if (!scene)
+		return false;
+
 	full_lock(scene);
 
 	if (sceneitems_match2(scene, item_order, item_order_size)) {
@@ -3407,9 +3750,7 @@ void obs_sceneitem_set_show_transition(obs_sceneitem_t *item,
 	if (item->show_transition)
 		obs_source_release(item->show_transition);
 
-	item->show_transition = transition;
-	if (item->show_transition)
-		obs_source_addref(item->show_transition);
+	item->show_transition = obs_source_get_ref(transition);
 }
 
 void obs_sceneitem_set_show_transition_duration(obs_sceneitem_t *item,
@@ -3442,9 +3783,7 @@ void obs_sceneitem_set_hide_transition(obs_sceneitem_t *item,
 	if (item->hide_transition)
 		obs_source_release(item->hide_transition);
 
-	item->hide_transition = transition;
-	if (item->hide_transition)
-		obs_source_addref(item->hide_transition);
+	item->hide_transition = obs_source_get_ref(transition);
 }
 
 void obs_sceneitem_set_hide_transition_duration(obs_sceneitem_t *item,
@@ -3467,6 +3806,46 @@ uint32_t obs_sceneitem_get_hide_transition_duration(obs_sceneitem_t *item)
 	if (!item)
 		return 0;
 	return item->hide_transition_duration;
+}
+
+void obs_sceneitem_set_transition(obs_sceneitem_t *item, bool show,
+				  obs_source_t *transition)
+{
+	if (!item)
+		return;
+
+	obs_source_t **target = show ? &item->show_transition
+				     : &item->hide_transition;
+	if (*target)
+		obs_source_release(*target);
+	*target = obs_source_get_ref(transition);
+}
+
+obs_source_t *obs_sceneitem_get_transition(obs_sceneitem_t *item, bool show)
+{
+	if (!item)
+		return NULL;
+
+	return show ? item->show_transition : item->hide_transition;
+}
+
+void obs_sceneitem_set_transition_duration(obs_sceneitem_t *item, bool show,
+					   uint32_t duration_ms)
+{
+	if (!item)
+		return;
+	if (show)
+		item->show_transition_duration = duration_ms;
+	else
+		item->hide_transition_duration = duration_ms;
+}
+
+uint32_t obs_sceneitem_get_transition_duration(obs_sceneitem_t *item, bool show)
+{
+	if (!item)
+		return 0;
+	return show ? item->show_transition_duration
+		    : item->hide_transition_duration;
 }
 
 void obs_sceneitem_transition_stop(void *data, calldata_t *calldata)
@@ -3493,16 +3872,12 @@ void obs_sceneitem_do_transition(obs_sceneitem_t *item, bool visible)
 	if (transition_active(item->hide_transition))
 		obs_transition_force_stop(item->hide_transition);
 
-	obs_source_t *transition =
-		visible ? obs_sceneitem_get_show_transition(item)
-			: obs_sceneitem_get_hide_transition(item);
+	obs_source_t *transition = obs_sceneitem_get_transition(item, visible);
 	if (!transition)
 		return;
 
 	int duration =
-		(int)(visible ? obs_sceneitem_get_show_transition_duration(item)
-			      : obs_sceneitem_get_hide_transition_duration(
-					item));
+		(int)obs_sceneitem_get_transition_duration(item, visible);
 
 	const int cx = obs_source_get_width(item->source);
 	const int cy = obs_source_get_height(item->source);
@@ -3543,19 +3918,14 @@ void obs_sceneitem_transition_load(struct obs_scene_item *item,
 		const char *tn = obs_data_get_string(data, "name");
 		obs_data_t *s = obs_data_get_obj(data, "transition");
 		obs_source_t *t = obs_source_create_private(id, tn, s);
-		if (show)
-			obs_sceneitem_set_show_transition(item, t);
-		else
-			obs_sceneitem_set_hide_transition(item, t);
+		obs_sceneitem_set_transition(item, show, t);
 		obs_source_release(t);
 		obs_data_release(s);
+	} else {
+		obs_sceneitem_set_transition(item, show, NULL);
 	}
-	if (show)
-		item->show_transition_duration =
-			(uint32_t)obs_data_get_int(data, "duration");
-	else
-		item->hide_transition_duration =
-			(uint32_t)obs_data_get_int(data, "duration");
+	obs_sceneitem_set_transition_duration(
+		item, show, (uint32_t)obs_data_get_int(data, "duration"));
 }
 
 obs_data_t *obs_sceneitem_transition_save(struct obs_scene_item *item,
@@ -3579,4 +3949,19 @@ obs_data_t *obs_sceneitem_transition_save(struct obs_scene_item *item,
 			 show ? item->show_transition_duration
 			      : item->hide_transition_duration);
 	return data;
+}
+
+void obs_scene_prune_sources(obs_scene_t *scene)
+{
+	obs_scene_item_ptr_array_t remove_items;
+	da_init(remove_items);
+
+	video_lock(scene);
+	update_transforms_and_prune_sources(scene, &remove_items, NULL);
+	video_unlock(scene);
+
+	for (size_t i = 0; i < remove_items.num; i++)
+		obs_sceneitem_release(remove_items.array[i]);
+
+	da_free(remove_items);
 }

@@ -81,12 +81,20 @@ static const char *my_dhm_G = "4";
 #include <nettle/md5.h>
 #else	/* USE_OPENSSL */
 #include <openssl/ssl.h>
-#include <openssl/rc4.h>
 #include <openssl/md5.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #endif
+#endif
 
+#if defined(TCP_USER_TIMEOUT)
+#define SOCKET_LEVEL IPPROTO_TCP
+#define SOCKET_TIMEOUT_OPT TCP_USER_TIMEOUT
+#define SOCKET_TIMEOUT_VAR(tv, s) int tv = s*1000
+#else
+#define SOCKET_LEVEL SOL_SOCKET
+#define SOCKET_TIMEOUT_OPT SO_SNDTIMEO
+#define SOCKET_TIMEOUT_VAR(tv, s) SET_RCVTIMEO(tv, s)
 #endif
 
 #define RTMP_SIG_SIZE 1536
@@ -306,42 +314,37 @@ RTMP_TLS_LoadCerts(RTMP *r) {
     CertFreeCertificateContext(pCertContext);
     CertCloseStore(hCertStore, 0);
 #elif defined(__APPLE__)
-    SecKeychainRef keychain_ref;
-    CFMutableDictionaryRef search_settings_ref;
-    CFArrayRef result_ref;
+    CFTypeRef keys[4] = {kSecClass, kSecMatchLimit, kSecReturnAttributes,
+                 kSecReturnData};
 
-    if (SecKeychainOpen("/System/Library/Keychains/SystemRootCertificates.keychain",
-                        &keychain_ref)
-        != errSecSuccess) {
-      goto error;
+    CFTypeRef values[4] = {kSecClassCertificate, kSecMatchLimitAll,
+                   kCFBooleanFalse, kCFBooleanTrue};
+    CFDictionaryRef query =
+        CFDictionaryCreate(kCFAllocatorDefault, keys, values, 4,
+                   &kCFTypeDictionaryKeyCallBacks,
+                   &kCFTypeDictionaryValueCallBacks);
+
+    CFTypeRef result;
+
+    OSStatus code = SecItemCopyMatching(query, &result);
+
+    if (code != noErr) {
+        goto error;
     }
 
-    search_settings_ref = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
-    CFDictionarySetValue(search_settings_ref, kSecClass, kSecClassCertificate);
-    CFDictionarySetValue(search_settings_ref, kSecMatchLimit, kSecMatchLimitAll);
-    CFDictionarySetValue(search_settings_ref, kSecReturnRef, kCFBooleanTrue);
-    CFDictionarySetValue(search_settings_ref, kSecMatchSearchList,
-                         CFArrayCreate(NULL, (const void **)&keychain_ref, 1, NULL));
+    for (CFIndex i = 0; i < CFArrayGetCount(result); i++) {
+        CFDataRef data_ref = CFArrayGetValueAtIndex(result, i);
 
-    if (SecItemCopyMatching(search_settings_ref, (CFTypeRef *)&result_ref)
-        != errSecSuccess) {
-      goto error;
+        const UInt8 *data = CFDataGetBytePtr(data_ref);
+        size_t length = CFDataGetLength(data_ref);
+
+        if (data && length > 0) {
+            mbedtls_x509_crt_parse_der(chain, data, length);
+        }
     }
 
-    for (CFIndex i = 0; i < CFArrayGetCount(result_ref); i++) {
-      SecCertificateRef item_ref = (SecCertificateRef)
-                                   CFArrayGetValueAtIndex(result_ref, i);
-      CFDataRef data_ref;
-
-      if ((data_ref = SecCertificateCopyData(item_ref))) {
-        mbedtls_x509_crt_parse_der(chain,
-                                   (unsigned char *)CFDataGetBytePtr(data_ref),
-                                   CFDataGetLength(data_ref));
-        CFRelease(data_ref);
-      }
-    }
-
-    CFRelease(keychain_ref);
+    CFRelease(result);
+    
 #elif defined(__linux__)
     if (mbedtls_x509_crt_parse_path(chain, "/etc/ssl/certs/") < 0) {
         RTMP_Log(RTMP_LOGERROR, "mbedtls_x509_crt_parse_path: Couldn't parse "
@@ -421,7 +424,7 @@ RTMP_TLS_Init(RTMP *r)
 
 void
 RTMP_TLS_Free(RTMP *r) {
-#ifdef USE_MBEDTLS
+#if defined(CRYPTO) && defined(USE_MBEDTLS)
 
     if (!r->RTMP_TLS_ctx)
         return;
@@ -452,9 +455,7 @@ RTMP_Alloc()
 void
 RTMP_Free(RTMP *r)
 {
-#if defined(CRYPTO) && defined(USE_MBEDTLS)
     RTMP_TLS_Free(r);
-#endif
     free(r);
 }
 
@@ -464,11 +465,7 @@ RTMP_Init(RTMP *r)
     memset(r, 0, sizeof(RTMP));
     r->m_sb.sb_socket = -1;
     RTMP_Reset(r);
-
-#ifdef CRYPTO
     RTMP_TLS_Init(r);
-#endif
-
 }
 
 void
@@ -485,7 +482,8 @@ RTMP_Reset(RTMP *r)
     r->m_fVideoCodecs = 252.0;
     r->Link.curStreamIdx = 0;
     r->Link.nStreams = 0;
-    r->Link.timeout = 30;
+    r->Link.receiveTimeout = 30;
+    r->Link.sendTimeout = 15;
     r->Link.swfAge = 30;
 }
 
@@ -778,7 +776,7 @@ add_addr_info(struct sockaddr_storage *service, socklen_t *addrlen, AVal *host, 
 
     char portStr[8];
 
-    sprintf(portStr, "%d", port);
+    snprintf(portStr, sizeof(portStr), "%d", port);
 
     int err = getaddrinfo(hostname, portStr, &hints, &result);
 
@@ -929,13 +927,22 @@ RTMP_Connect0(RTMP *r, struct sockaddr * service, socklen_t addrlen)
 
     /* set timeout */
     {
-        SET_RCVTIMEO(tv, r->Link.timeout);
+        SET_RCVTIMEO(tvr, r->Link.receiveTimeout);
         if (setsockopt
-                (r->m_sb.sb_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv)))
+                (r->m_sb.sb_socket, SOL_SOCKET, SO_RCVTIMEO, (char *)&tvr, sizeof(tvr)))
         {
-            RTMP_Log(RTMP_LOGERROR, "%s, Setting socket timeout to %ds failed!",
-                     __FUNCTION__, r->Link.timeout);
+            RTMP_Log(RTMP_LOGERROR, "%s, Setting socket receive timeout to %ds failed!",
+                     __FUNCTION__, r->Link.receiveTimeout);
         }
+
+#if defined(SOCKET_TIMEOUT_OPT)
+		SOCKET_TIMEOUT_VAR(to, r->Link.sendTimeout);
+		if (setsockopt(r->m_sb.sb_socket, SOCKET_LEVEL, SOCKET_TIMEOUT_OPT, &to, sizeof(to)))
+        {
+                RTMP_Log(RTMP_LOGERROR, "%s, Setting socket SOCKET_TIMEOUT_OPT to %ds failed!",
+                     __FUNCTION__, r->Link.sendTimeout);
+        }
+#endif
     }
 
     if(!r->m_bUseNagle)
@@ -954,7 +961,11 @@ RTMP_Connect1(RTMP *r, RTMPPacket *cp)
 
 #if defined(USE_MBEDTLS)
         mbedtls_net_context *server_fd = &r->RTMP_TLS_ctx->net;
+#if MBEDTLS_VERSION_NUMBER == 0x03000000
+        server_fd->MBEDTLS_PRIVATE(fd) = r->m_sb.sb_socket;
+#else
         server_fd->fd = r->m_sb.sb_socket;
+#endif
         TLS_setfd(r->m_sb.sb_ssl, server_fd);
 
         // make sure we verify the certificate hostname
@@ -1540,13 +1551,6 @@ ReadN(RTMP *r, char *buffer, int n)
         if (r->Link.protocol & RTMP_FEATURE_HTTP)
             r->m_resplen -= nBytes;
 
-#ifdef CRYPTO
-        if (r->Link.rc4keyIn)
-        {
-            RC4_encrypt(r->Link.rc4keyIn, nBytes, ptr);
-        }
-#endif
-
         n -= nBytes;
         ptr += nBytes;
     }
@@ -1558,20 +1562,7 @@ static int
 WriteN(RTMP *r, const char *buffer, int n)
 {
     const char *ptr = buffer;
-#ifdef CRYPTO
-    char *encrypted = 0;
-    char buf[RTMP_BUFFER_CACHE_SIZE];
-
-    if (r->Link.rc4keyOut)
-    {
-        if (n > (int)sizeof(buf))
-            encrypted = (char *)malloc(n);
-        else
-            encrypted = (char *)buf;
-        ptr = encrypted;
-        RC4_encrypt2(r->Link.rc4keyOut, n, buffer, ptr);
-    }
-#endif
+    struct linger l;
 
     while (n > 0)
     {
@@ -1596,6 +1587,15 @@ WriteN(RTMP *r, const char *buffer, int n)
 
             r->last_error_code = sockerr;
 
+            // Force-close the socket. Sometimes a send() error isn't fatal, so
+            // we could end up writing an unpublish message which some services
+            // treat as a clean shutdown. We need to disable lingering too so
+            // the remote side sees an abortive shutdown (RST).
+            l.l_onoff = 1;
+            l.l_linger = 0;
+            setsockopt(r->m_sb.sb_socket, SOL_SOCKET, SO_LINGER, (char *)&l, sizeof(l));
+            RTMPSockBuf_Close(&r->m_sb);
+
             RTMP_Close(r);
             n = 1;
             break;
@@ -1607,11 +1607,6 @@ WriteN(RTMP *r, const char *buffer, int n)
         n -= nBytes;
         ptr += nBytes;
     }
-
-#ifdef CRYPTO
-    if (encrypted && encrypted != buf)
-        free(encrypted);
-#endif
 
     return n == 0;
 }
@@ -1684,6 +1679,11 @@ SendConnectPacket(RTMP *r, RTMPPacket *cp)
         enc = AMF_EncodeNamedString(enc, pend, &av_type, &av_nonprivate);
         if (!enc)
             return FALSE;
+
+        if (r->Link.customConnectEncode)
+        {
+            r->Link.customConnectEncode(&enc, pend);
+        }
     }
     if (r->Link.flashVer.av_len)
     {
@@ -2602,7 +2602,7 @@ b64enc(const unsigned char *input, int length, char *output, int maxsize)
 #if defined(USE_MBEDTLS)
 typedef	mbedtls_md5_context MD5_CTX;
 
-#if MBEDTLS_VERSION_NUMBER >= 0x02070000
+#if MBEDTLS_VERSION_NUMBER >= 0x02070000 && MBEDTLS_VERSION_MAJOR < 3
 #define MD5_Init(ctx)	mbedtls_md5_init(ctx); mbedtls_md5_starts_ret(ctx)
 #define MD5_Update(ctx,data,len)	mbedtls_md5_update_ret(ctx,(unsigned char *)data,len)
 #define MD5_Final(dig,ctx)	mbedtls_md5_finish_ret(ctx,dig); mbedtls_md5_free(ctx)
@@ -2628,12 +2628,12 @@ typedef struct md5_ctx	MD5_CTX;
 static const AVal av_authmod_adobe = AVC("authmod=adobe");
 static const AVal av_authmod_llnw  = AVC("authmod=llnw");
 
-static void hexenc(unsigned char *inbuf, int len, char *dst)
+static void hexenc(unsigned char *inbuf, int len, char *dst, size_t size)
 {
     char *ptr = dst;
     while(len--)
     {
-        sprintf(ptr, "%02x", *inbuf++);
+        snprintf(ptr, size, "%02x", *inbuf++);
         ptr += 2;
     }
     *ptr = '\0';
@@ -2681,8 +2681,9 @@ PublisherAuth(RTMP *r, AVal *description)
             }
             else if(r->Link.pubUser.av_len && r->Link.pubPasswd.av_len)
             {
-                pubToken.av_val = malloc(r->Link.pubUser.av_len + av_authmod_adobe.av_len + 8);
-                pubToken.av_len = sprintf(pubToken.av_val, "?%s&user=%s",
+                size_t val_size = r->Link.pubUser.av_len + av_authmod_adobe.av_len + 8;
+                pubToken.av_val = malloc(val_size);
+                pubToken.av_len = snprintf(pubToken.av_val, val_size, "?%s&user=%s",
                                           av_authmod_adobe.av_val,
                                           r->Link.pubUser.av_val);
                 RTMP_Log(RTMP_LOGDEBUG, "%s, pubToken1: %s", __FUNCTION__, pubToken.av_val);
@@ -2782,8 +2783,9 @@ PublisherAuth(RTMP *r, AVal *description)
             RTMP_Log(RTMP_LOGDEBUG, "%s, b64(md5_2) = %s", __FUNCTION__, response);
 
             /* have all hashes, create auth token for the end of app */
-            pubToken.av_val = malloc(32 + B64INT_LEN + B64DIGEST_LEN + opaque.av_len);
-            pubToken.av_len = sprintf(pubToken.av_val,
+            size_t val_size = 32 + B64INT_LEN + B64DIGEST_LEN + opaque.av_len;
+            pubToken.av_val = malloc(val_size);
+            pubToken.av_len = snprintf(pubToken.av_val, val_size,
                                       "&challenge=%s&response=%s&opaque=%s",
                                       challenge2,
                                       response,
@@ -2850,8 +2852,9 @@ PublisherAuth(RTMP *r, AVal *description)
             }
             else if(r->Link.pubUser.av_len && r->Link.pubPasswd.av_len)
             {
-                pubToken.av_val = malloc(r->Link.pubUser.av_len + av_authmod_llnw.av_len + 8);
-                pubToken.av_len = sprintf(pubToken.av_val, "?%s&user=%s",
+                size_t val_size = r->Link.pubUser.av_len + av_authmod_llnw.av_len + 8;
+                pubToken.av_val = malloc(val_size);
+                pubToken.av_len = snprintf(pubToken.av_val, val_size, "?%s&user=%s",
                                           av_authmod_llnw.av_val,
                                           r->Link.pubUser.av_val);
                 RTMP_Log(RTMP_LOGDEBUG, "%s, pubToken1: %s", __FUNCTION__, pubToken.av_val);
@@ -2928,8 +2931,8 @@ PublisherAuth(RTMP *r, AVal *description)
 
             /* FIXME: handle case where user==NULL or nonce==NULL */
 
-            sprintf(nchex, "%08x", nc);
-            sprintf(cnonce, "%08x", rand());
+            snprintf(nchex, sizeof(nchex), "%08x", nc);
+            snprintf(cnonce, sizeof(cnonce), "%08x", rand());
 
             /* hash1 = hexenc(md5(user + ":" + realm + ":" + password)) */
             MD5_Init(&md5ctx);
@@ -2942,7 +2945,7 @@ PublisherAuth(RTMP *r, AVal *description)
             RTMP_Log(RTMP_LOGDEBUG, "%s, md5(%s:%s:%s) =>", __FUNCTION__,
                      user.av_val, realm, r->Link.pubPasswd.av_val);
             RTMP_LogHexString(RTMP_LOGDEBUG, md5sum_val, MD5_DIGEST_LENGTH);
-            hexenc(md5sum_val, MD5_DIGEST_LENGTH, hash1);
+            hexenc(md5sum_val, MD5_DIGEST_LENGTH, hash1, sizeof(hash1));
 
             /* hash2 = hexenc(md5(method + ":/" + app + "/" + appInstance)) */
             /* Extract appname + appinstance without query parameters */
@@ -2961,7 +2964,7 @@ PublisherAuth(RTMP *r, AVal *description)
             RTMP_Log(RTMP_LOGDEBUG, "%s, md5(%s:/%.*s) =>", __FUNCTION__,
                      method, apptmp.av_len, apptmp.av_val);
             RTMP_LogHexString(RTMP_LOGDEBUG, md5sum_val, MD5_DIGEST_LENGTH);
-            hexenc(md5sum_val, MD5_DIGEST_LENGTH, hash2);
+            hexenc(md5sum_val, MD5_DIGEST_LENGTH, hash2, sizeof(hash2));
 
             /* hash3 = hexenc(md5(hash1 + ":" + nonce + ":" + nchex + ":" + cnonce + ":" + qop + ":" + hash2)) */
             MD5_Init(&md5ctx);
@@ -2980,13 +2983,14 @@ PublisherAuth(RTMP *r, AVal *description)
             RTMP_Log(RTMP_LOGDEBUG, "%s, md5(%s:%s:%s:%s:%s:%s) =>", __FUNCTION__,
                      hash1, nonce.av_val, nchex, cnonce, qop, hash2);
             RTMP_LogHexString(RTMP_LOGDEBUG, md5sum_val, MD5_DIGEST_LENGTH);
-            hexenc(md5sum_val, MD5_DIGEST_LENGTH, hash3);
+            hexenc(md5sum_val, MD5_DIGEST_LENGTH, hash3, sizeof(hash3));
 
             /* pubToken = &authmod=<authmod>&user=<username>&nonce=<nonce>&cnonce=<cnonce>&nc=<nchex>&response=<hash3> */
             /* Append nonces and response to query string which already contains
              * user + authmod */
-            pubToken.av_val = malloc(64 + sizeof(authmod)-1 + user.av_len + nonce.av_len + sizeof(cnonce)-1 + sizeof(nchex)-1 + HEXHASH_LEN);
-            sprintf(pubToken.av_val,
+            size_t token_size = 64 + sizeof(authmod)-1 + user.av_len + nonce.av_len + sizeof(cnonce)-1 + sizeof(nchex)-1 + HEXHASH_LEN;
+            pubToken.av_val = malloc(token_size);
+            snprintf(pubToken.av_val, token_size,
                     "&nonce=%s&cnonce=%s&nc=%s&response=%s",
                     nonce.av_val, cnonce, nchex, hash3);
             pubToken.av_len = (int)strlen(pubToken.av_val);
@@ -3492,23 +3496,23 @@ DumpMetaData(AMFObject *obj)
             DumpMetaData(&prop->p_vu.p_object);
             break;
         case AMF_NUMBER:
-            snprintf(str, 255, "%.2f", prop->p_vu.p_number);
+            snprintf(str, sizeof(str), "%.2f", prop->p_vu.p_number);
             break;
         case AMF_BOOLEAN:
-            snprintf(str, 255, "%s",
+            snprintf(str, sizeof(str), "%s",
                      prop->p_vu.p_number != 0. ? "TRUE" : "FALSE");
             break;
         case AMF_STRING:
-            len = snprintf(str, 255, "%.*s", prop->p_vu.p_aval.av_len,
+            len = snprintf(str, sizeof(str), "%.*s", prop->p_vu.p_aval.av_len,
                            prop->p_vu.p_aval.av_val);
             if (len >= 1 && str[len-1] == '\n')
                 str[len-1] = '\0';
             break;
         case AMF_DATE:
-            snprintf(str, 255, "timestamp:%.2f", prop->p_vu.p_number);
+            snprintf(str, sizeof(str), "timestamp:%.2f", prop->p_vu.p_number);
             break;
         default:
-            snprintf(str, 255, "INVALID TYPE 0x%02x",
+            snprintf(str, sizeof(str), "INVALID TYPE 0x%02x",
                      (unsigned char)prop->p_type);
         }
         if (str[0] && prop->p_name.av_len)
@@ -4403,22 +4407,6 @@ RTMP_Close(RTMP *r)
         r->Link.app.av_val = NULL;
         free(r->Link.tcUrl.av_val);
         r->Link.tcUrl.av_val = NULL;
-    }
-#elif defined(CRYPTO)
-    if (r->Link.dh)
-    {
-        MDH_free(r->Link.dh);
-        r->Link.dh = NULL;
-    }
-    if (r->Link.rc4keyIn)
-    {
-        RC4_free(r->Link.rc4keyIn);
-        r->Link.rc4keyIn = NULL;
-    }
-    if (r->Link.rc4keyOut)
-    {
-        RC4_free(r->Link.rc4keyOut);
-        r->Link.rc4keyOut = NULL;
     }
 #else
     for (int idx = 0; idx < r->Link.nStreams; idx++)

@@ -1,18 +1,20 @@
 #include <inttypes.h>
 #include <obs-module.h>
 #include <obs-hotkey.h>
+#include <util/dstr.h>
 #include <util/platform.h>
 #include <util/threading.h>
+#include <util/windows/window-helpers.h>
 #include <windows.h>
 #include <dxgi.h>
 #include <util/sse-intrin.h>
 #include <util/util_uint64.h>
 #include <ipc-util/pipe.h>
-#include "obfuscate.h"
+#include <util/windows/obfuscate.h>
 #include "inject-library.h"
+#include "compat-helpers.h"
 #include "graphics-hook-info.h"
 #include "graphics-hook-ver.h"
-#include "window-helpers.h"
 #include "cursor-capture.h"
 #include "app-helpers.h"
 #include "nt-stuff.h"
@@ -29,7 +31,6 @@
 
 #define SETTING_MODE                 "capture_mode"
 #define SETTING_CAPTURE_WINDOW       "window"
-#define SETTING_ACTIVE_WINDOW        "active_window"
 #define SETTING_WINDOW_PRIORITY      "priority"
 #define SETTING_COMPATIBILITY        "sli_compatibility"
 #define SETTING_CURSOR               "capture_cursor"
@@ -38,6 +39,8 @@
 #define SETTING_CAPTURE_OVERLAYS     "capture_overlays"
 #define SETTING_ANTI_CHEAT_HOOK      "anti_cheat_hook"
 #define SETTING_HOOK_RATE            "hook_rate"
+#define SETTING_RGBA10A2_SPACE       "rgb10a2_space"
+#define SETTINGS_COMPAT_INFO         "compat_info"
 
 /* deprecated */
 #define SETTING_ANY_FULLSCREEN   "capture_any_fullscreen"
@@ -49,25 +52,28 @@
 #define HOTKEY_START             "hotkey_start"
 #define HOTKEY_STOP              "hotkey_stop"
 
-#define TEXT_MODE                obs_module_text("Mode")
-#define TEXT_GAME_CAPTURE        obs_module_text("GameCapture")
-#define TEXT_ANY_FULLSCREEN      obs_module_text("GameCapture.AnyFullscreen")
-#define TEXT_SLI_COMPATIBILITY   obs_module_text("SLIFix")
-#define TEXT_ALLOW_TRANSPARENCY  obs_module_text("AllowTransparency")
-#define TEXT_WINDOW              obs_module_text("WindowCapture.Window")
-#define TEXT_MATCH_PRIORITY      obs_module_text("WindowCapture.Priority")
-#define TEXT_MATCH_TITLE         obs_module_text("WindowCapture.Priority.Title")
-#define TEXT_MATCH_CLASS         obs_module_text("WindowCapture.Priority.Class")
-#define TEXT_MATCH_EXE           obs_module_text("WindowCapture.Priority.Exe")
-#define TEXT_CAPTURE_CURSOR      obs_module_text("CaptureCursor")
-#define TEXT_LIMIT_FRAMERATE     obs_module_text("GameCapture.LimitFramerate")
-#define TEXT_CAPTURE_OVERLAYS    obs_module_text("GameCapture.CaptureOverlays")
-#define TEXT_ANTI_CHEAT_HOOK     obs_module_text("GameCapture.AntiCheatHook")
-#define TEXT_HOOK_RATE           obs_module_text("GameCapture.HookRate")
-#define TEXT_HOOK_RATE_SLOW      obs_module_text("GameCapture.HookRate.Slow")
-#define TEXT_HOOK_RATE_NORMAL    obs_module_text("GameCapture.HookRate.Normal")
-#define TEXT_HOOK_RATE_FAST      obs_module_text("GameCapture.HookRate.Fast")
-#define TEXT_HOOK_RATE_FASTEST   obs_module_text("GameCapture.HookRate.Fastest")
+#define TEXT_MODE                  obs_module_text("Mode")
+#define TEXT_GAME_CAPTURE          obs_module_text("GameCapture")
+#define TEXT_ANY_FULLSCREEN        obs_module_text("GameCapture.AnyFullscreen")
+#define TEXT_SLI_COMPATIBILITY     obs_module_text("SLIFix")
+#define TEXT_ALLOW_TRANSPARENCY    obs_module_text("AllowTransparency")
+#define TEXT_WINDOW                obs_module_text("WindowCapture.Window")
+#define TEXT_MATCH_PRIORITY        obs_module_text("WindowCapture.Priority")
+#define TEXT_MATCH_TITLE           obs_module_text("WindowCapture.Priority.Title")
+#define TEXT_MATCH_CLASS           obs_module_text("WindowCapture.Priority.Class")
+#define TEXT_MATCH_EXE             obs_module_text("WindowCapture.Priority.Exe")
+#define TEXT_CAPTURE_CURSOR        obs_module_text("CaptureCursor")
+#define TEXT_LIMIT_FRAMERATE       obs_module_text("GameCapture.LimitFramerate")
+#define TEXT_CAPTURE_OVERLAYS      obs_module_text("GameCapture.CaptureOverlays")
+#define TEXT_ANTI_CHEAT_HOOK       obs_module_text("GameCapture.AntiCheatHook")
+#define TEXT_HOOK_RATE             obs_module_text("GameCapture.HookRate")
+#define TEXT_HOOK_RATE_SLOW        obs_module_text("GameCapture.HookRate.Slow")
+#define TEXT_HOOK_RATE_NORMAL      obs_module_text("GameCapture.HookRate.Normal")
+#define TEXT_HOOK_RATE_FAST        obs_module_text("GameCapture.HookRate.Fast")
+#define TEXT_HOOK_RATE_FASTEST     obs_module_text("GameCapture.HookRate.Fastest")
+#define TEXT_RGBA10A2_SPACE        obs_module_text("GameCapture.Rgb10a2Space")
+#define TEXT_RGBA10A2_SPACE_SRGB   obs_module_text("GameCapture.Rgb10a2Space.Srgb")
+#define TEXT_RGBA10A2_SPACE_2100PQ obs_module_text("GameCapture.Rgb10a2Space.2100PQ")
 
 #define TEXT_MODE_ANY            TEXT_ANY_FULLSCREEN
 #define TEXT_MODE_WINDOW         obs_module_text("GameCapture.CaptureWindow")
@@ -94,6 +100,9 @@ enum hook_rate {
 	HOOK_RATE_FASTEST
 };
 
+#define RGBA10A2_SPACE_SRGB "srgb"
+#define RGBA10A2_SPACE_2100PQ "2100pq"
+
 struct game_capture_config {
 	char *title;
 	char *class;
@@ -107,7 +116,13 @@ struct game_capture_config {
 	bool capture_overlays;
 	bool anticheat_hook;
 	enum hook_rate hook_rate;
+	bool is_10a2_2100pq;
 };
+
+typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_SetThreadDpiAwarenessContext)(
+	DPI_AWARENESS_CONTEXT);
+typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_GetThreadDpiAwarenessContext)(VOID);
+typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_GetWindowDpiAwarenessContext)(HWND);
 
 struct game_capture {
 	obs_source_t *source;
@@ -149,7 +164,10 @@ struct game_capture {
 
 	ipc_pipe_server_t pipe;
 	gs_texture_t *texture;
-	bool supports_srgb;
+	gs_texture_t *extra_texture;
+	gs_texrender_t *extra_texrender;
+	bool is_10a2_2100pq;
+	bool linear_sample;
 	struct hook_info *global_hook_info;
 	HANDLE keepalive_mutex;
 	HANDLE hook_init;
@@ -176,6 +194,10 @@ struct game_capture {
 	};
 
 	void (*copy_texture)(struct game_capture *);
+
+	PFN_SetThreadDpiAwarenessContext set_thread_dpi_awareness_context;
+	PFN_GetThreadDpiAwarenessContext get_thread_dpi_awareness_context;
+	PFN_GetWindowDpiAwarenessContext get_window_dpi_awareness_context;
 };
 
 struct graphics_offsets offsets32 = {0};
@@ -275,9 +297,9 @@ static inline HANDLE open_process(DWORD desired_access, bool inherit_handle,
 				  DWORD process_id)
 {
 	typedef HANDLE(WINAPI * PFN_OpenProcess)(DWORD, BOOL, DWORD);
-	PFN_OpenProcess open_process_proc = NULL;
+	static PFN_OpenProcess open_process_proc = NULL;
 	if (!open_process_proc)
-		open_process_proc = (PFN_OpenProcess)get_obfuscated_func(
+		open_process_proc = (PFN_OpenProcess)ms_get_obfuscated_func(
 			kernel32(), "NuagUykjcxr", 0x1B694B59451ULL);
 
 	return open_process_proc(desired_access, inherit_handle, process_id);
@@ -332,12 +354,14 @@ static void stop_capture(struct game_capture *gc)
 	close_handle(&gc->texture_mutexes[0]);
 	close_handle(&gc->texture_mutexes[1]);
 
-	if (gc->texture) {
-		obs_enter_graphics();
-		gs_texture_destroy(gc->texture);
-		obs_leave_graphics();
-		gc->texture = NULL;
-	}
+	obs_enter_graphics();
+	gs_texrender_destroy(gc->extra_texrender);
+	gc->extra_texrender = NULL;
+	gs_texture_destroy(gc->extra_texture);
+	gc->extra_texture = NULL;
+	gs_texture_destroy(gc->texture);
+	gc->texture = NULL;
+	obs_leave_graphics();
 
 	if (gc->active)
 		info("capture stopped");
@@ -389,8 +413,8 @@ static inline void get_config(struct game_capture_config *cfg,
 {
 	const char *mode_str = NULL;
 
-	build_window_strings(window, &cfg->class, &cfg->title,
-			     &cfg->executable);
+	ms_build_window_strings(window, &cfg->class, &cfg->title,
+				&cfg->executable);
 
 	if (using_older_non_mode_format(settings)) {
 		bool any = obs_data_get_bool(settings, SETTING_ANY_FULLSCREEN);
@@ -420,6 +444,9 @@ static inline void get_config(struct game_capture_config *cfg,
 		obs_data_get_bool(settings, SETTING_ANTI_CHEAT_HOOK);
 	cfg->hook_rate =
 		(enum hook_rate)obs_data_get_int(settings, SETTING_HOOK_RATE);
+	cfg->is_10a2_2100pq =
+		strcmp(obs_data_get_string(settings, SETTING_RGBA10A2_SPACE),
+		       "2100pq") == 0;
 }
 
 static inline int s_cmp(const char *str1, const char *str2)
@@ -516,6 +543,7 @@ static void game_capture_update(void *data, obs_data_t *settings)
 	gc->retry_interval = DEFAULT_RETRY_INTERVAL *
 			     hook_rate_to_float(gc->config.hook_rate);
 	gc->wait_for_target_startup = false;
+	gc->is_10a2_2100pq = gc->config.is_10a2_2100pq;
 
 	dstr_free(&gc->title);
 	dstr_free(&gc->class);
@@ -552,6 +580,35 @@ static void *game_capture_create(obs_data_t *settings, obs_source_t *source)
 	gc->hotkey_pair = obs_hotkey_pair_register_source(
 		gc->source, HOTKEY_START, TEXT_HOTKEY_START, HOTKEY_STOP,
 		TEXT_HOTKEY_STOP, hotkey_start, hotkey_stop, gc, gc);
+
+	const HMODULE hModuleUser32 = GetModuleHandle(L"User32.dll");
+	if (hModuleUser32) {
+		PFN_SetThreadDpiAwarenessContext
+			set_thread_dpi_awareness_context =
+				(PFN_SetThreadDpiAwarenessContext)GetProcAddress(
+					hModuleUser32,
+					"SetThreadDpiAwarenessContext");
+		PFN_GetThreadDpiAwarenessContext
+			get_thread_dpi_awareness_context =
+				(PFN_GetThreadDpiAwarenessContext)GetProcAddress(
+					hModuleUser32,
+					"GetThreadDpiAwarenessContext");
+		PFN_GetWindowDpiAwarenessContext
+			get_window_dpi_awareness_context =
+				(PFN_GetWindowDpiAwarenessContext)GetProcAddress(
+					hModuleUser32,
+					"GetWindowDpiAwarenessContext");
+		if (set_thread_dpi_awareness_context &&
+		    get_thread_dpi_awareness_context &&
+		    get_window_dpi_awareness_context) {
+			gc->set_thread_dpi_awareness_context =
+				set_thread_dpi_awareness_context;
+			gc->get_thread_dpi_awareness_context =
+				get_thread_dpi_awareness_context;
+			gc->get_window_dpi_awareness_context =
+				get_window_dpi_awareness_context;
+		}
+	}
 
 	game_capture_update(gc, settings);
 	return gc;
@@ -767,7 +824,7 @@ static void pipe_log(void *param, uint8_t *data, size_t size)
 static inline bool init_pipe(struct game_capture *gc)
 {
 	char name[64];
-	sprintf(name, "%s%lu", PIPE_NAME, gc->process_id);
+	snprintf(name, sizeof(name), "%s%lu", PIPE_NAME, gc->process_id);
 
 	if (!ipc_pipe_server_start(&gc->pipe, name, pipe_log, gc)) {
 		warn("init_pipe: failed to start pipe");
@@ -966,12 +1023,12 @@ static bool init_hook(struct game_capture *gc)
 	bool blacklisted_process = false;
 
 	if (gc->config.mode == CAPTURE_MODE_ANY) {
-		if (get_window_exe(&exe, gc->next_window)) {
+		if (ms_get_window_exe(&exe, gc->next_window)) {
 			info("attempting to hook fullscreen process: %s",
 			     exe.array);
 		}
 	} else {
-		if (get_window_exe(&exe, gc->next_window)) {
+		if (ms_get_window_exe(&exe, gc->next_window)) {
 			info("attempting to hook process: %s", exe.array);
 		}
 	}
@@ -1111,9 +1168,9 @@ static void get_selected_window(struct game_capture *gc)
 		os_utf8_to_wcs(gc->class.array, 0, class_w, 512);
 		window = FindWindowW(class_w, NULL);
 	} else {
-		window = find_window(INCLUDE_MINIMIZED, gc->priority,
-				     gc->class.array, gc->title.array,
-				     gc->executable.array);
+		window = ms_find_window(INCLUDE_MINIMIZED, gc->priority,
+					gc->class.array, gc->title.array,
+					gc->executable.array);
 	}
 
 	if (window) {
@@ -1267,9 +1324,6 @@ static inline enum capture_result init_capture_data(struct game_capture *gc)
 
 	return CAPTURE_SUCCESS;
 }
-
-#define PIXEL_16BIT_SIZE 2
-#define PIXEL_32BIT_SIZE 4
 
 static inline uint32_t convert_5_to_8bit(uint16_t val)
 {
@@ -1552,49 +1606,111 @@ static inline bool is_16bit_format(uint32_t format)
 
 static inline bool init_shmem_capture(struct game_capture *gc)
 {
-	enum gs_color_format format;
-
-	gc->texture_buffers[0] =
-		(uint8_t *)gc->data + gc->shmem_data->tex1_offset;
-	gc->texture_buffers[1] =
-		(uint8_t *)gc->data + gc->shmem_data->tex2_offset;
-
-	gc->convert_16bit = is_16bit_format(gc->global_hook_info->format);
-	format = gc->convert_16bit
-			 ? GS_BGRA
-			 : convert_format(gc->global_hook_info->format);
+	const uint32_t dxgi_format = gc->global_hook_info->format;
+	const bool convert_16bit = is_16bit_format(dxgi_format);
+	const enum gs_color_format format =
+		convert_16bit ? GS_BGRA : convert_format(dxgi_format);
 
 	obs_enter_graphics();
+	gs_texrender_destroy(gc->extra_texrender);
+	gc->extra_texrender = NULL;
+	gs_texture_destroy(gc->extra_texture);
+	gc->extra_texture = NULL;
 	gs_texture_destroy(gc->texture);
-	gc->texture =
+	gc->texture = NULL;
+	gs_texture_t *const texture =
 		gs_texture_create(gc->cx, gc->cy, format, 1, NULL, GS_DYNAMIC);
 	obs_leave_graphics();
 
-	if (!gc->texture) {
+	bool success = texture != NULL;
+	if (success) {
+		const bool linear_sample = format != GS_R10G10B10A2;
+
+		gs_texrender_t *extra_texrender = NULL;
+		if (!linear_sample) {
+			extra_texrender =
+				gs_texrender_create(GS_RGBA16F, GS_ZS_NONE);
+			success = extra_texrender != NULL;
+			if (!success)
+				warn("init_shmem_capture: failed to create extra texrender");
+		}
+
+		if (success) {
+			gc->texture_buffers[0] = (uint8_t *)gc->data +
+						 gc->shmem_data->tex1_offset;
+			gc->texture_buffers[1] = (uint8_t *)gc->data +
+						 gc->shmem_data->tex2_offset;
+			gc->convert_16bit = convert_16bit;
+
+			gc->texture = texture;
+			gc->extra_texture = NULL;
+			gc->extra_texrender = extra_texrender;
+			gc->linear_sample = linear_sample;
+			gc->copy_texture = copy_shmem_tex;
+		} else {
+			gs_texture_destroy(texture);
+		}
+	} else {
 		warn("init_shmem_capture: failed to create texture");
-		return false;
 	}
 
-	gc->supports_srgb = true;
-	gc->copy_texture = copy_shmem_tex;
-	return true;
+	return success;
 }
 
 static inline bool init_shtex_capture(struct game_capture *gc)
 {
 	obs_enter_graphics();
+	gs_texrender_destroy(gc->extra_texrender);
+	gc->extra_texrender = NULL;
+	gs_texture_destroy(gc->extra_texture);
+	gc->extra_texture = NULL;
 	gs_texture_destroy(gc->texture);
-	gc->texture = gs_texture_open_shared(gc->shtex_data->tex_handle);
-	enum gs_color_format format = gs_texture_get_color_format(gc->texture);
-	gc->supports_srgb = gs_is_srgb_format(format);
+	gc->texture = NULL;
+	gs_texture_t *const texture =
+		gs_texture_open_shared(gc->shtex_data->tex_handle);
+	bool success = texture != NULL;
+	if (success) {
+		enum gs_color_format format =
+			gs_texture_get_color_format(texture);
+		const bool ten_bit_srgb = (format == GS_R10G10B10A2);
+		enum gs_color_format linear_format =
+			ten_bit_srgb ? GS_RGBA16F
+				     : gs_generalize_format(format);
+		const bool linear_sample = (linear_format == format);
+		gs_texture_t *extra_texture = NULL;
+		gs_texrender_t *extra_texrender = NULL;
+		if (!linear_sample) {
+			if (ten_bit_srgb) {
+				extra_texrender = gs_texrender_create(
+					linear_format, GS_ZS_NONE);
+				success = extra_texrender != NULL;
+				if (!success)
+					warn("init_shtex_capture: failed to create extra texrender");
+			} else {
+				extra_texture = gs_texture_create(
+					gs_texture_get_width(texture),
+					gs_texture_get_height(texture),
+					linear_format, 1, NULL, 0);
+				success = extra_texture != NULL;
+				if (!success)
+					warn("init_shtex_capture: failed to create extra texture");
+			}
+		}
+
+		if (success) {
+			gc->texture = texture;
+			gc->linear_sample = linear_sample;
+			gc->extra_texture = extra_texture;
+			gc->extra_texrender = extra_texrender;
+		} else {
+			gs_texture_destroy(texture);
+		}
+	} else {
+		warn("init_shtex_capture: failed to open shared handle");
+	}
 	obs_leave_graphics();
 
-	if (!gc->texture) {
-		warn("init_shtex_capture: failed to open shared handle");
-		return false;
-	}
-
-	return true;
+	return success;
 }
 
 static bool start_capture(struct game_capture *gc)
@@ -1663,12 +1779,12 @@ static void game_capture_tick(void *data, float seconds)
 		HWND hwnd = (HWND)(uintptr_t)os_atomic_load_long(
 			&gc->hotkey_window);
 
-		if (is_uwp_window(hwnd))
-			hwnd = get_uwp_actual_window(hwnd);
+		if (ms_is_uwp_window(hwnd))
+			hwnd = ms_get_uwp_actual_window(hwnd);
 
-		if (get_window_exe(&gc->executable, hwnd)) {
-			get_window_title(&gc->title, hwnd);
-			get_window_class(&gc->class, hwnd);
+		if (ms_get_window_exe(&gc->executable, hwnd)) {
+			ms_get_window_title(&gc->title, hwnd);
+			ms_get_window_class(&gc->class, hwnd);
 
 			gc->priority = WINDOW_PRIORITY_CLASS;
 			gc->retry_time = 10.0f * hook_rate_to_float(
@@ -1766,10 +1882,26 @@ static void game_capture_tick(void *data, float seconds)
 			}
 
 			if (gc->config.cursor) {
+				DPI_AWARENESS_CONTEXT previous = NULL;
+				if (gc->get_window_dpi_awareness_context !=
+				    NULL) {
+					const DPI_AWARENESS_CONTEXT context =
+						gc->get_window_dpi_awareness_context(
+							gc->window);
+					previous =
+						gc->set_thread_dpi_awareness_context(
+							context);
+				}
+
 				check_foreground_window(gc, seconds);
 				obs_enter_graphics();
 				cursor_capture(&gc->cursor_data);
 				obs_leave_graphics();
+
+				if (previous) {
+					gc->set_thread_dpi_awareness_context(
+						previous);
+				}
 			}
 
 			gc->fps_reset_time += seconds;
@@ -1796,57 +1928,277 @@ static inline void game_capture_render_cursor(struct game_capture *gc)
 			 ? (HWND)(uintptr_t)gc->global_hook_info->window
 			 : gc->window;
 
+	DPI_AWARENESS_CONTEXT previous = NULL;
+	if (gc->get_window_dpi_awareness_context != NULL) {
+		const DPI_AWARENESS_CONTEXT context =
+			gc->get_window_dpi_awareness_context(gc->window);
+		previous = gc->set_thread_dpi_awareness_context(context);
+	}
+
 	ClientToScreen(window, &p);
+
+	if (previous)
+		gc->set_thread_dpi_awareness_context(previous);
 
 	cursor_draw(&gc->cursor_data, -p.x, -p.y, gc->global_hook_info->cx,
 		    gc->global_hook_info->cy);
 }
 
-static void game_capture_render(void *data, gs_effect_t *effect)
+static void game_capture_render(void *data, gs_effect_t *unused)
 {
+	UNUSED_PARAMETER(unused);
+
 	struct game_capture *gc = data;
 	if (!gc->texture || !gc->active)
 		return;
 
-	effect = obs_get_base_effect(gc->config.allow_transparency
-					     ? OBS_EFFECT_DEFAULT
-					     : OBS_EFFECT_OPAQUE);
+	const bool allow_transparency = gc->config.allow_transparency;
+	gs_effect_t *const effect = obs_get_base_effect(
+		allow_transparency ? OBS_EFFECT_DEFAULT : OBS_EFFECT_OPAQUE);
 
-	const bool linear_srgb = gs_get_linear_srgb() && gc->supports_srgb;
-	const bool previous = gs_set_linear_srgb(linear_srgb);
+	gs_texture_t *texture = gc->texture;
+	enum gs_color_space source_space = GS_CS_SRGB;
+	bool is_10a2_compressed = false;
+	if (gs_texture_get_color_format(texture) == GS_R10G10B10A2) {
+		is_10a2_compressed = true;
+		source_space = gc->is_10a2_2100pq ? GS_CS_709_EXTENDED
+						  : GS_CS_SRGB_16F;
+	} else if (gs_texture_get_color_format(texture) == GS_RGBA16F) {
+		source_space = GS_CS_709_SCRGB;
+	}
 
-	while (gs_effect_loop(effect, "Draw")) {
-		obs_source_draw(gc->texture, 0, 0, 0, 0,
-				gc->global_hook_info->flip);
+	bool linear_sample = gc->linear_sample;
+	const enum gs_color_space current_space = gs_get_color_space();
+	const bool texcoords_centered =
+		obs_source_get_texcoords_centered(gc->source);
+	if (!linear_sample && !texcoords_centered) {
+		if (gs_texture_get_color_format(texture) == GS_R10G10B10A2) {
+			gs_texrender_t *const texrender = gc->extra_texrender;
+			gs_texrender_reset(texrender);
+			const uint32_t cx = gs_texture_get_width(texture);
+			const uint32_t cy = gs_texture_get_height(texture);
+			if (gs_texrender_begin(texrender, cx, cy)) {
+				gs_effect_t *const default_effect =
+					obs_get_base_effect(OBS_EFFECT_DEFAULT);
+				gs_enable_blending(false);
+				gs_ortho(0.0f, (float)cx, 0.0f, (float)cy,
+					 -100.0f, 100.0f);
+				gs_eparam_t *const image =
+					gs_effect_get_param_by_name(
+						default_effect, "image");
+				gs_effect_set_texture(image, texture);
 
-		if (gc->config.allow_transparency && gc->config.cursor &&
-		    !gc->cursor_hidden) {
-			game_capture_render_cursor(gc);
+				const char *tech_name = "DrawSrgbDecompress";
+				if (gc->is_10a2_2100pq) {
+					tech_name = "DrawPQ";
+
+					const float multiplier =
+						10000.f /
+						obs_get_video_sdr_white_level();
+					gs_effect_set_float(
+						gs_effect_get_param_by_name(
+							default_effect,
+							"multiplier"),
+						multiplier);
+				}
+
+				while (gs_effect_loop(default_effect,
+						      tech_name)) {
+					gs_draw_sprite(texture, 0, 0, 0);
+				}
+				gs_enable_blending(true);
+
+				gs_texrender_end(texrender);
+
+				texture = gs_texrender_get_texture(texrender);
+			}
+
+			is_10a2_compressed = false;
+		} else {
+			gs_texture_t *const extra_texture = gc->extra_texture;
+			if (extra_texture) {
+				gs_copy_texture(extra_texture, texture);
+				texture = extra_texture;
+			} else {
+				gs_texrender_t *const texrender =
+					gc->extra_texrender;
+				gs_texrender_reset(texrender);
+				const uint32_t cx =
+					gs_texture_get_width(texture);
+				const uint32_t cy =
+					gs_texture_get_height(texture);
+				if (gs_texrender_begin(texrender, cx, cy)) {
+					gs_effect_t *const default_effect =
+						obs_get_base_effect(
+							OBS_EFFECT_DEFAULT);
+					const bool previous =
+						gs_framebuffer_srgb_enabled();
+					gs_enable_framebuffer_srgb(false);
+					gs_enable_blending(false);
+					gs_ortho(0.0f, (float)cx, 0.0f,
+						 (float)cy, -100.0f, 100.0f);
+					gs_eparam_t *const image =
+						gs_effect_get_param_by_name(
+							default_effect,
+							"image");
+					gs_effect_set_texture(image, texture);
+					while (gs_effect_loop(default_effect,
+							      "Draw")) {
+						gs_draw_sprite(texture, 0, 0,
+							       0);
+					}
+					gs_enable_blending(true);
+					gs_enable_framebuffer_srgb(previous);
+
+					gs_texrender_end(texrender);
+
+					texture = gs_texrender_get_texture(
+						texrender);
+				}
+			}
+		}
+
+		linear_sample = true;
+	}
+
+	gs_eparam_t *const image = gs_effect_get_param_by_name(effect, "image");
+	const uint32_t flip = gc->global_hook_info->flip ? GS_FLIP_V : 0;
+
+	const char *tech_name = "Draw";
+	float multiplier = 1.f;
+	switch (source_space) {
+	case GS_CS_SRGB:
+		switch (current_space) {
+		case GS_CS_SRGB:
+			if (allow_transparency && !linear_sample)
+				tech_name = "DrawSrgbDecompress";
+			break;
+		case GS_CS_SRGB_16F:
+		case GS_CS_709_EXTENDED:
+			if (!linear_sample)
+				tech_name = "DrawSrgbDecompress";
+			break;
+		case GS_CS_709_SCRGB:
+			if (linear_sample)
+				tech_name = "DrawMultiply";
+			else
+				tech_name = "DrawSrgbDecompressMultiply";
+			multiplier = obs_get_video_sdr_white_level() / 80.f;
+		}
+		break;
+	case GS_CS_SRGB_16F:
+		linear_sample = true;
+		switch (current_space) {
+		case GS_CS_SRGB:
+		case GS_CS_SRGB_16F:
+		case GS_CS_709_EXTENDED:
+			tech_name = is_10a2_compressed ? "DrawSrgbDecompress"
+						       : "Draw";
+			break;
+		case GS_CS_709_SCRGB:
+			tech_name = is_10a2_compressed
+					    ? "DrawSrgbDecompressMultiply"
+					    : "DrawMultiply";
+			multiplier = obs_get_video_sdr_white_level() / 80.f;
+		}
+		break;
+	case GS_CS_709_EXTENDED:
+		linear_sample = true;
+		if (is_10a2_compressed) {
+			switch (current_space) {
+			case GS_CS_SRGB:
+			case GS_CS_SRGB_16F:
+				tech_name = "DrawTonemapPQ";
+				multiplier = 10000.f /
+					     obs_get_video_sdr_white_level();
+				break;
+			case GS_CS_709_EXTENDED:
+				tech_name = "DrawPQ";
+				multiplier = 10000.f /
+					     obs_get_video_sdr_white_level();
+				break;
+			case GS_CS_709_SCRGB:
+				tech_name = "DrawPQ";
+				multiplier = 10000.f / 80.f;
+			}
+		} else {
+			switch (current_space) {
+			case GS_CS_SRGB:
+			case GS_CS_SRGB_16F:
+				tech_name = "DrawTonemap";
+				break;
+			case GS_CS_709_SCRGB:
+				tech_name = "DrawMultiply";
+				multiplier =
+					obs_get_video_sdr_white_level() / 80.f;
+			}
+		}
+		break;
+	case GS_CS_709_SCRGB:
+		linear_sample = true;
+		switch (current_space) {
+		case GS_CS_SRGB:
+		case GS_CS_SRGB_16F:
+			tech_name = "DrawMultiplyTonemap";
+			multiplier = 80.f / obs_get_video_sdr_white_level();
+			break;
+		case GS_CS_709_EXTENDED:
+			tech_name = "DrawMultiply";
+			multiplier = 80.f / obs_get_video_sdr_white_level();
 		}
 	}
 
-	gs_set_linear_srgb(previous);
+	while (gs_effect_loop(effect, tech_name)) {
+		const bool previous = gs_framebuffer_srgb_enabled();
+		gs_enable_framebuffer_srgb(allow_transparency || linear_sample);
+		gs_enable_blending(allow_transparency);
+		if (linear_sample)
+			gs_effect_set_texture_srgb(image, texture);
+		else
+			gs_effect_set_texture(image, texture);
+		gs_effect_set_float(gs_effect_get_param_by_name(effect,
+								"multiplier"),
+				    multiplier);
+		gs_draw_sprite(texture, flip, 0, 0);
+		gs_enable_blending(true);
+		gs_enable_framebuffer_srgb(previous);
+	}
 
-	if (!gc->config.allow_transparency && gc->config.cursor &&
-	    !gc->cursor_hidden) {
-		effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	if (gc->config.cursor && !gc->cursor_hidden) {
+		gs_effect_t *const default_effect =
+			obs_get_base_effect(OBS_EFFECT_DEFAULT);
 
-		while (gs_effect_loop(effect, "Draw")) {
+		const char *cursor_tech_name = "Draw";
+		float cursor_multiplier = 1.f;
+		if (current_space == GS_CS_709_SCRGB) {
+			cursor_tech_name = "DrawMultiply";
+			cursor_multiplier =
+				obs_get_video_sdr_white_level() / 80.f;
+		}
+
+		const bool previous = gs_set_linear_srgb(true);
+
+		while (gs_effect_loop(default_effect, cursor_tech_name)) {
+			gs_effect_set_float(gs_effect_get_param_by_name(
+						    effect, "multiplier"),
+					    cursor_multiplier);
 			game_capture_render_cursor(gc);
 		}
+
+		gs_set_linear_srgb(previous);
 	}
 }
 
 static uint32_t game_capture_width(void *data)
 {
 	struct game_capture *gc = data;
-	return gc->active ? gc->cx : 0;
+	return (gc->active && gc->capturing) ? gc->cx : 0;
 }
 
 static uint32_t game_capture_height(void *data)
 {
 	struct game_capture *gc = data;
-	return gc->active ? gc->cy : 0;
+	return (gc->active && gc->capturing) ? gc->cy : 0;
 }
 
 static const char *game_capture_name(void *unused)
@@ -1868,6 +2220,8 @@ static void game_capture_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, SETTING_ANTI_CHEAT_HOOK, true);
 	obs_data_set_default_int(settings, SETTING_HOOK_RATE,
 				 (int)HOOK_RATE_NORMAL);
+	obs_data_set_default_string(settings, SETTING_RGBA10A2_SPACE,
+				    RGBA10A2_SPACE_SRGB);
 }
 
 static bool mode_callback(obs_properties_t *ppts, obs_property_t *p,
@@ -1892,63 +2246,53 @@ static bool mode_callback(obs_properties_t *ppts, obs_property_t *p,
 	return true;
 }
 
-static void insert_preserved_val(obs_property_t *p, const char *val, size_t idx)
-{
-	char *class = NULL;
-	char *title = NULL;
-	char *executable = NULL;
-	struct dstr desc = {0};
-
-	build_window_strings(val, &class, &title, &executable);
-
-	dstr_printf(&desc, "[%s]: %s", executable, title);
-	obs_property_list_insert_string(p, idx, desc.array, val);
-	obs_property_list_item_disable(p, idx, true);
-
-	dstr_free(&desc);
-	bfree(class);
-	bfree(title);
-	bfree(executable);
-}
-
-bool check_window_property_setting(obs_properties_t *ppts, obs_property_t *p,
-				   obs_data_t *settings, const char *val,
-				   size_t idx)
-{
-	const char *cur_val;
-	bool match = false;
-	size_t i = 0;
-
-	cur_val = obs_data_get_string(settings, val);
-	if (!cur_val) {
-		return false;
-	}
-
-	for (;;) {
-		const char *val = obs_property_list_item_string(p, i++);
-		if (!val)
-			break;
-
-		if (strcmp(val, cur_val) == 0) {
-			match = true;
-			break;
-		}
-	}
-
-	if (cur_val && *cur_val && !match) {
-		insert_preserved_val(p, cur_val, idx);
-		return true;
-	}
-
-	UNUSED_PARAMETER(ppts);
-	return false;
-}
-
 static bool window_changed_callback(obs_properties_t *ppts, obs_property_t *p,
 				    obs_data_t *settings)
 {
-	return check_window_property_setting(ppts, p, settings,
-					     SETTING_CAPTURE_WINDOW, 1);
+	bool modified = ms_check_window_property_setting(
+		ppts, p, settings, SETTING_CAPTURE_WINDOW, 1);
+
+	bool capture_any;
+	if (using_older_non_mode_format(settings)) {
+		capture_any =
+			obs_data_get_bool(settings, SETTING_ANY_FULLSCREEN);
+	} else {
+		const char *mode = obs_data_get_string(settings, SETTING_MODE);
+		capture_any = strcmp(mode, SETTING_MODE_ANY) == 0 ||
+			      strcmp(mode, SETTING_MODE_HOTKEY) == 0;
+	}
+
+	if (capture_any)
+		return modified;
+
+	const char *window =
+		obs_data_get_string(settings, SETTING_CAPTURE_WINDOW);
+
+	char *class;
+	char *exe;
+	char *title;
+	ms_build_window_strings(window, &class, &title, &exe);
+	struct compat_result *compat =
+		check_compatibility(title, class, exe, GAME_CAPTURE);
+	bfree(title);
+	bfree(exe);
+	bfree(class);
+
+	obs_property_t *p_warn = obs_properties_get(ppts, SETTINGS_COMPAT_INFO);
+
+	if (!compat) {
+		modified = obs_property_visible(p_warn) || modified;
+		obs_property_set_visible(p_warn, false);
+		return modified;
+	}
+
+	obs_property_set_long_description(p_warn, compat->message);
+	obs_property_text_set_info_type(p_warn, compat->severity);
+	obs_property_set_visible(p_warn, true);
+
+	compat_result_free(compat);
+
+	return true;
 }
 
 static BOOL CALLBACK EnumFirstMonitor(HMONITOR monitor, HDC hdc, LPRECT rc,
@@ -2022,7 +2366,7 @@ static obs_properties_t *game_capture_properties(void *data)
 				    OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(p, "", "");
-	fill_window_list(p, INCLUDE_MINIMIZED, window_not_blacklisted);
+	ms_fill_window_list(p, INCLUDE_MINIMIZED, window_not_blacklisted);
 
 	obs_property_set_modified_callback(p, window_changed_callback);
 
@@ -2032,6 +2376,10 @@ static obs_properties_t *game_capture_properties(void *data)
 	obs_property_list_add_int(p, TEXT_MATCH_TITLE, WINDOW_PRIORITY_TITLE);
 	obs_property_list_add_int(p, TEXT_MATCH_CLASS, WINDOW_PRIORITY_CLASS);
 	obs_property_list_add_int(p, TEXT_MATCH_EXE, WINDOW_PRIORITY_EXE);
+
+	p = obs_properties_add_text(ppts, SETTINGS_COMPAT_INFO, NULL,
+				    OBS_TEXT_INFO);
+	obs_property_set_enabled(p, false);
 
 	obs_properties_add_bool(ppts, SETTING_COMPATIBILITY,
 				TEXT_SLI_COMPATIBILITY);
@@ -2057,8 +2405,54 @@ static obs_properties_t *game_capture_properties(void *data)
 	obs_property_list_add_int(p, TEXT_HOOK_RATE_FAST, HOOK_RATE_FAST);
 	obs_property_list_add_int(p, TEXT_HOOK_RATE_FASTEST, HOOK_RATE_FASTEST);
 
-	UNUSED_PARAMETER(data);
+	p = obs_properties_add_list(ppts, SETTING_RGBA10A2_SPACE,
+				    TEXT_RGBA10A2_SPACE, OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, TEXT_RGBA10A2_SPACE_SRGB,
+				     RGBA10A2_SPACE_SRGB);
+	obs_property_list_add_string(p, TEXT_RGBA10A2_SPACE_2100PQ,
+				     RGBA10A2_SPACE_2100PQ);
+
 	return ppts;
+}
+
+enum gs_color_space
+game_capture_get_color_space(void *data, size_t count,
+			     const enum gs_color_space *preferred_spaces)
+{
+	enum gs_color_space capture_space = GS_CS_SRGB;
+
+	struct game_capture *const gc = data;
+	if (gc->texture) {
+		const enum gs_color_format format =
+			gs_texture_get_color_format(gc->texture);
+		if (((format == GS_R10G10B10A2) && gc->is_10a2_2100pq) ||
+		    (format == GS_RGBA16F)) {
+			for (size_t i = 0; i < count; ++i) {
+				if (preferred_spaces[i] == GS_CS_709_SCRGB)
+					return GS_CS_709_SCRGB;
+			}
+
+			capture_space = GS_CS_709_EXTENDED;
+		} else if (format == GS_R10G10B10A2) {
+			for (size_t i = 0; i < count; ++i) {
+				if (preferred_spaces[i] == GS_CS_SRGB_16F)
+					return GS_CS_SRGB_16F;
+			}
+
+			capture_space = GS_CS_709_EXTENDED;
+		}
+	}
+
+	enum gs_color_space space = capture_space;
+	for (size_t i = 0; i < count; ++i) {
+		const enum gs_color_space preferred_space = preferred_spaces[i];
+		space = preferred_space;
+		if (preferred_space == capture_space)
+			break;
+	}
+
+	return space;
 }
 
 struct obs_source_info game_capture_info = {
@@ -2077,4 +2471,5 @@ struct obs_source_info game_capture_info = {
 	.video_tick = game_capture_tick,
 	.video_render = game_capture_render,
 	.icon_type = OBS_ICON_TYPE_GAME_CAPTURE,
+	.video_get_color_space = game_capture_get_color_space,
 };

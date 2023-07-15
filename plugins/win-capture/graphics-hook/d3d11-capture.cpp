@@ -3,7 +3,6 @@
 
 #include "dxgi-helpers.hpp"
 #include "graphics-hook.h"
-#include "../funchook.h"
 
 struct d3d11_data {
 	ID3D11Device *device;         /* do not release */
@@ -175,6 +174,8 @@ static inline bool d3d11_init_format(IDXGISwapChain *swap, HWND &window)
 		return false;
 	}
 
+	print_swap_desc(&desc);
+
 	data.format = strip_dxgi_format_srgb(desc.BufferDesc.Format);
 	data.multisampled = desc.SampleDesc.Count > 1;
 	window = desc.OutputWindow;
@@ -337,7 +338,7 @@ static inline void d3d11_shmem_capture(ID3D11Resource *backbuffer)
 	data.cur_tex = next_tex;
 }
 
-void d3d11_capture(void *swap_ptr, void *backbuffer_ptr, bool)
+void d3d11_capture(void *swap_ptr, void *backbuffer_ptr)
 {
 	IDXGIResource *dxgi_backbuffer = (IDXGIResource *)backbuffer_ptr;
 	IDXGISwapChain *swap = (IDXGISwapChain *)swap_ptr;

@@ -1,5 +1,5 @@
 /******************************************************************************
-    Copyright (C) 2015 by Hugh Bailey <obs.jim@gmail.com>
+    Copyright (C) 2023 by Lain Bailey <lain@obsproject.com>
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -53,7 +53,7 @@ void EnumSceneCollections(std::function<bool(const char *, const char *)> &&cb)
 		if (glob->gl_pathv[i].directory)
 			continue;
 
-		obs_data_t *data =
+		OBSDataAutoRelease data =
 			obs_data_create_from_json_file_safe(filePath, "bak");
 		std::string name = obs_data_get_string(data, "name");
 
@@ -63,8 +63,6 @@ void EnumSceneCollections(std::function<bool(const char *, const char *)> &&cb)
 			name = strrchr(filePath, '/') + 1;
 			name.resize(name.size() - 5);
 		}
-
-		obs_data_release(data);
 
 		if (!cb(name.c_str(), filePath))
 			break;
@@ -159,12 +157,19 @@ bool OBSBasic::AddSceneCollection(bool create_new, const QString &qname)
 				  "SceneCollection", name.c_str());
 		config_set_string(App()->GlobalConfig(), "Basic",
 				  "SceneCollectionFile", file.c_str());
+
 		if (create_new) {
 			CreateDefaultScene(false);
+		} else {
+			obs_reset_source_uuids();
 		}
+
 		SaveProjectNow();
 		RefreshSceneCollections();
 	};
+
+	if (api)
+		api->on_event(OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING);
 
 	new_collection(file, name);
 
@@ -289,10 +294,8 @@ void OBSBasic::on_actionRenameSceneCollection_triggered()
 	UpdateTitleBar();
 	RefreshSceneCollections();
 
-	if (api) {
-		api->on_event(OBS_FRONTEND_EVENT_SCENE_COLLECTION_LIST_CHANGED);
-		api->on_event(OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED);
-	}
+	if (api)
+		api->on_event(OBS_FRONTEND_EVENT_SCENE_COLLECTION_RENAMED);
 }
 
 void OBSBasic::on_actionRemoveSceneCollection_triggered()
@@ -321,8 +324,8 @@ void OBSBasic::on_actionRemoveSceneCollection_triggered()
 	if (newPath.empty())
 		return;
 
-	QString text = QTStr("ConfirmRemove.Text");
-	text.replace("$1", QT_UTF8(oldName.c_str()));
+	QString text =
+		QTStr("ConfirmRemove.Text").arg(QT_UTF8(oldName.c_str()));
 
 	QMessageBox::StandardButton button = OBSMessageBox::question(
 		this, QTStr("ConfirmRemove.Title"), text);
@@ -336,12 +339,12 @@ void OBSBasic::on_actionRemoveSceneCollection_triggered()
 		return;
 	}
 
-	oldFile.insert(0, path);
-	oldFile += ".json";
+	if (api)
+		api->on_event(OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING);
 
-	os_unlink(oldFile.c_str());
-	oldFile += ".bak";
-	os_unlink(oldFile.c_str());
+	oldFile.insert(0, path);
+	/* os_rename() overwrites if necessary, only the .bak file will remain. */
+	os_rename((oldFile + ".json").c_str(), (oldFile + ".json.bak").c_str());
 
 	Load(newPath.c_str());
 	RefreshSceneCollections();
@@ -365,10 +368,8 @@ void OBSBasic::on_actionRemoveSceneCollection_triggered()
 
 void OBSBasic::on_actionImportSceneCollection_triggered()
 {
-	OBSImporter *imp;
-	imp = new OBSImporter(this);
-	imp->exec();
-	delete imp;
+	OBSImporter imp(this);
+	imp.exec();
 
 	RefreshSceneCollections();
 }
@@ -397,10 +398,46 @@ void OBSBasic::on_actionExportSceneCollection_triggered()
 	string file = QT_TO_UTF8(exportFile);
 
 	if (!exportFile.isEmpty() && !exportFile.isNull()) {
-		if (QFile::exists(exportFile))
-			QFile::remove(exportFile);
+		QString inputFile = path + currentFile + ".json";
 
-		QFile::copy(path + currentFile + ".json", exportFile);
+		OBSDataAutoRelease collection =
+			obs_data_create_from_json_file(QT_TO_UTF8(inputFile));
+
+		OBSDataArrayAutoRelease sources =
+			obs_data_get_array(collection, "sources");
+		if (!sources) {
+			blog(LOG_WARNING,
+			     "No sources in exported scene collection");
+			return;
+		}
+		obs_data_erase(collection, "sources");
+
+		// We're just using std::sort on a vector to make life easier.
+		vector<OBSData> sourceItems;
+		obs_data_array_enum(
+			sources,
+			[](obs_data_t *data, void *pVec) -> void {
+				auto &sourceItems =
+					*static_cast<vector<OBSData> *>(pVec);
+				sourceItems.push_back(data);
+			},
+			&sourceItems);
+
+		std::sort(sourceItems.begin(), sourceItems.end(),
+			  [](const OBSData &a, const OBSData &b) {
+				  return astrcmpi(obs_data_get_string(a,
+								      "name"),
+						  obs_data_get_string(
+							  b, "name")) < 0;
+			  });
+
+		OBSDataArrayAutoRelease newSources = obs_data_array_create();
+		for (auto &item : sourceItems)
+			obs_data_array_push_back(newSources, item);
+
+		obs_data_set_array(collection, "sources", newSources);
+		obs_data_save_json_pretty_safe(
+			collection, QT_TO_UTF8(exportFile), "tmp", "bak");
 	}
 }
 
@@ -423,6 +460,9 @@ void OBSBasic::ChangeSceneCollection()
 		action->setChecked(true);
 		return;
 	}
+
+	if (api)
+		api->on_event(OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING);
 
 	SaveProjectNow();
 

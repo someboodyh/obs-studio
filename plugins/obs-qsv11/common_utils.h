@@ -1,18 +1,11 @@
-/*****************************************************************************
-
-INTEL CORPORATION PROPRIETARY INFORMATION
-This software is supplied under the terms of a license agreement or
-nondisclosure agreement with Intel Corporation and may not be copied
-or disclosed except in accordance with the terms of that agreement.
-Copyright(c) 2005-2014 Intel Corporation. All Rights Reserved.
-
-*****************************************************************************/
-
 #pragma once
 
 #include <stdio.h>
 
-#include "mfxvideo++.h"
+// Most of this file shouldnt be accessed from C.
+#ifdef __cplusplus
+
+#include <mfxvideo++.h>
 
 // =================================================================
 // OS-specific definitions of types, macro, etc...
@@ -153,3 +146,24 @@ void mfxGetTime(mfxTime *timestamp);
 
 //void mfxInitTime();  might need this for Windows
 double TimeDiffMsec(mfxTime tfinish, mfxTime tstart);
+
+extern "C" {
+#endif // __cplusplus
+
+struct adapter_info {
+	bool is_intel;
+	bool is_dgpu;
+	bool supports_av1;
+	bool supports_hevc;
+};
+
+#define MAX_ADAPTERS 10
+extern struct adapter_info adapters[MAX_ADAPTERS];
+extern size_t adapter_count;
+
+void util_cpuid(int cpuinfo[4], int flags);
+void check_adapters(struct adapter_info *adapters, size_t *adapter_count);
+
+#ifdef __cplusplus
+}
+#endif

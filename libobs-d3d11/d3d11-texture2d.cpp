@@ -1,5 +1,5 @@
 /******************************************************************************
-    Copyright (C) 2013 by Hugh Bailey <obs.jim@gmail.com>
+    Copyright (C) 2023 by Lain Bailey <lain@obsproject.com>
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -50,26 +50,31 @@ void gs_texture_2d::InitSRD(vector<D3D11_SUBRESOURCE_DATA> &srd)
 
 void gs_texture_2d::BackupTexture(const uint8_t *const *data)
 {
-	this->data.resize(levels);
-
-	uint32_t w = width;
-	uint32_t h = height;
+	uint32_t textures = type == GS_TEXTURE_CUBE ? 6 : 1;
 	uint32_t bbp = gs_get_format_bpp(format);
 
-	for (uint32_t i = 0; i < levels; i++) {
-		if (!data[i])
-			break;
+	this->data.resize(levels * textures);
 
-		uint32_t texSize = bbp * w * h / 8;
-		this->data[i].resize(texSize);
+	for (uint32_t t = 0; t < textures; t++) {
+		uint32_t w = width;
+		uint32_t h = height;
 
-		vector<uint8_t> &subData = this->data[i];
-		memcpy(&subData[0], data[i], texSize);
+		for (uint32_t lv = 0; lv < levels; lv++) {
+			uint32_t i = levels * t + lv;
+			if (!data[i])
+				break;
 
-		if (w > 1)
-			w /= 2;
-		if (h > 1)
-			h /= 2;
+			uint32_t texSize = bbp * w * h / 8;
+
+			vector<uint8_t> &subData = this->data[i];
+			subData.resize(texSize);
+			memcpy(&subData[0], data[i], texSize);
+
+			if (w > 1)
+				w /= 2;
+			if (h > 1)
+				h /= 2;
+		}
 	}
 }
 
@@ -98,7 +103,9 @@ void gs_texture_2d::InitTexture(const uint8_t *const *data)
 	td.Height = height;
 	td.MipLevels = genMipmaps ? 0 : levels;
 	td.ArraySize = type == GS_TEXTURE_CUBE ? 6 : 1;
-	td.Format = nv12 ? DXGI_FORMAT_NV12 : dxgiFormatResource;
+	td.Format = twoPlane ? ((format == GS_R16) ? DXGI_FORMAT_P010
+						   : DXGI_FORMAT_NV12)
+			     : dxgiFormatResource;
 	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 	td.SampleDesc.Count = 1;
 	td.CPUAccessFlags = isDynamic ? D3D11_CPU_ACCESS_WRITE : 0;
@@ -261,7 +268,7 @@ gs_texture_2d::gs_texture_2d(gs_device_t *device, uint32_t width,
 			     uint32_t height, gs_color_format colorFormat,
 			     uint32_t levels, const uint8_t *const *data,
 			     uint32_t flags_, gs_texture_type type,
-			     bool gdiCompatible, bool nv12_)
+			     bool gdiCompatible, bool twoPlane_)
 	: gs_texture(device, gs_type::gs_texture_2d, type, levels, colorFormat),
 	  width(width),
 	  height(height),
@@ -275,7 +282,7 @@ gs_texture_2d::gs_texture_2d(gs_device_t *device, uint32_t width,
 	  isShared((flags_ & SHARED_FLAGS) != 0),
 	  genMipmaps((flags_ & GS_BUILD_MIPMAPS) != 0),
 	  sharedHandle(GS_INVALID_HANDLE),
-	  nv12(nv12_)
+	  twoPlane(twoPlane_)
 {
 	InitTexture(data);
 	InitResourceView();
@@ -291,37 +298,50 @@ gs_texture_2d::gs_texture_2d(gs_device_t *device, ID3D11Texture2D *nv12tex,
 	  isDynamic((flags_ & GS_DYNAMIC) != 0),
 	  isShared((flags_ & SHARED_FLAGS) != 0),
 	  genMipmaps((flags_ & GS_BUILD_MIPMAPS) != 0),
-	  nv12(true),
+	  twoPlane(true),
 	  texture(nv12tex)
 {
 	texture->GetDesc(&td);
 
+	const bool p010 = td.Format == DXGI_FORMAT_P010;
+	const DXGI_FORMAT dxgi_format = p010 ? DXGI_FORMAT_R16G16_UNORM
+					     : DXGI_FORMAT_R8G8_UNORM;
+
 	this->type = GS_TEXTURE_2D;
-	this->format = GS_R8G8;
+	this->format = p010 ? GS_RG16 : GS_R8G8;
 	this->flags = flags_;
 	this->levels = 1;
 	this->device = device;
 	this->chroma = true;
 	this->width = td.Width / 2;
 	this->height = td.Height / 2;
-	this->dxgiFormatResource = DXGI_FORMAT_R8G8_UNORM;
-	this->dxgiFormatView = DXGI_FORMAT_R8G8_UNORM;
-	this->dxgiFormatViewLinear = DXGI_FORMAT_R8G8_UNORM;
+	this->dxgiFormatResource = dxgi_format;
+	this->dxgiFormatView = dxgi_format;
+	this->dxgiFormatViewLinear = dxgi_format;
 
 	InitResourceView();
 	if (isRenderTarget)
 		InitRenderTargets();
 }
 
-gs_texture_2d::gs_texture_2d(gs_device_t *device, uint32_t handle)
+gs_texture_2d::gs_texture_2d(gs_device_t *device, uint32_t handle,
+			     bool ntHandle)
 	: gs_texture(device, gs_type::gs_texture_2d, GS_TEXTURE_2D),
 	  isShared(true),
 	  sharedHandle(handle)
 {
 	HRESULT hr;
-	hr = device->device->OpenSharedResource((HANDLE)(uintptr_t)handle,
-						__uuidof(ID3D11Texture2D),
-						(void **)texture.Assign());
+	if (ntHandle) {
+		ComQIPtr<ID3D11Device1> dev = device->device;
+		hr = dev->OpenSharedResource1((HANDLE)(uintptr_t)handle,
+					      __uuidof(ID3D11Texture2D),
+					      (void **)texture.Assign());
+	} else {
+		hr = device->device->OpenSharedResource(
+			(HANDLE)(uintptr_t)handle, __uuidof(ID3D11Texture2D),
+			(void **)texture.Assign());
+	}
+
 	if (FAILED(hr))
 		throw HRError("Failed to open shared 2D texture", hr);
 

@@ -56,17 +56,12 @@ struct ff_codec_desc {
 
 void ff_init()
 {
-#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58, 9, 100)
-	av_register_all();
-	//avdevice_register_all();
-	avcodec_register_all();
-#endif
 	avformat_network_init();
 }
 
 const char *ff_codec_name_from_id(int codec_id)
 {
-	AVCodec *codec = avcodec_find_encoder(codec_id);
+	const AVCodec *codec = avcodec_find_encoder(codec_id);
 	if (codec != NULL)
 		return codec->name;
 	else
@@ -103,7 +98,6 @@ static bool get_codecs(const AVCodecDescriptor ***descs, unsigned int *size)
 
 static const AVCodec *next_codec_for_id(enum AVCodecID id, const AVCodec *prev)
 {
-#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(58, 9, 100)
 	const AVCodec *cur = NULL;
 	void *i = 0;
 	bool found_prev = false;
@@ -121,12 +115,7 @@ static const AVCodec *next_codec_for_id(enum AVCodecID id, const AVCodec *prev)
 			}
 		}
 	}
-#else
-	while ((prev = av_codec_next(prev)) != NULL) {
-		if (prev->id == id && av_codec_is_encoder(prev))
-			return prev;
-	}
-#endif
+
 	return NULL;
 }
 
@@ -159,7 +148,7 @@ static void add_codec_to_list(const struct ff_format_desc *format_desc,
 	d->name = codec->name;
 	d->long_name = codec->long_name;
 	d->id = codec->id;
-	AVCodec *base_codec = avcodec_find_encoder(codec->id);
+	const AVCodec *base_codec = avcodec_find_encoder(codec->id);
 	if (strcmp(base_codec->name, codec->name) != 0) {
 		d->alias = true;
 		d->base_name = base_codec->name;
@@ -306,14 +295,9 @@ const struct ff_format_desc *ff_format_supported()
 	const AVOutputFormat *output_format = NULL;
 	struct ff_format_desc *desc = NULL;
 	struct ff_format_desc *current = NULL;
-
-#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(58, 9, 100)
+	
 	void *i = 0;
-
 	while ((output_format = av_muxer_iterate(&i)) != NULL) {
-#else
-	while ((output_format = av_oformat_next(output_format)) != NULL) {
-#endif
 		struct ff_format_desc *d;
 		if (is_output_device(output_format->priv_class))
 			continue;
@@ -415,7 +399,7 @@ ff_format_desc_next(const struct ff_format_desc *format_desc)
 static const char *get_encoder_name(const struct ff_format_desc *format_desc,
                                     enum AVCodecID codec_id)
 {
-	AVCodec *codec = avcodec_find_encoder(codec_id);
+	const AVCodec *codec = avcodec_find_encoder(codec_id);
 	if (codec == NULL && codec_id == AV_CODEC_ID_NONE)
 		return NULL;
 	else if (codec == NULL)
@@ -446,4 +430,39 @@ void ff_format_desc_free(const struct ff_format_desc *format_desc)
 		av_free((void *)desc);
 		desc = next;
 	}
+}
+
+
+bool ff_format_codec_compatible(const char *codec, const char *format)
+{
+	if (!codec || !format)
+		return false;
+
+#if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(59, 0, 100)
+	AVOutputFormat *output_format;
+#else
+	const AVOutputFormat *output_format;
+#endif
+	output_format = av_guess_format(format, NULL, NULL);
+	if (!output_format)
+		return false;
+	
+	const AVCodecDescriptor *codec_desc = avcodec_descriptor_get_by_name(codec);
+	if (!codec_desc)
+		return false;
+	
+#if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(60, 0, 100)
+	return avformat_query_codec(output_format, codec_desc->id, FF_COMPLIANCE_EXPERIMENTAL) == 1;
+#else
+	return avformat_query_codec(output_format, codec_desc->id, FF_COMPLIANCE_NORMAL) == 1;
+#endif
+}
+
+bool ff_supports_pcm_in_mp4()
+{
+#if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(60, 5, 100)
+	return false;
+#else
+	return true;
+#endif
 }

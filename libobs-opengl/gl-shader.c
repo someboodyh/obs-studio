@@ -1,5 +1,5 @@
 /******************************************************************************
-    Copyright (C) 2013 by Hugh Bailey <obs.jim@gmail.com>
+    Copyright (C) 2023 by Lain Bailey <lain@obsproject.com>
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -228,12 +228,15 @@ static bool gl_shader_init(struct gs_shader *shader,
 
 		char *infoLog = malloc(sizeof(char) * infoLength);
 
-		GLsizei returnedLength = 0;
-		glGetShaderInfoLog(shader->obj, infoLength, &returnedLength,
-				   infoLog);
-		blog(LOG_ERROR, "Error compiling shader:\n%s\n", infoLog);
+		if (infoLog) {
+			GLsizei returnedLength = 0;
+			glGetShaderInfoLog(shader->obj, infoLength,
+					   &returnedLength, infoLog);
+			blog(LOG_ERROR, "Error compiling shader:\n%s\n",
+			     infoLog);
 
-		free(infoLog);
+			free(infoLog);
+		}
 
 		success = false;
 	}
@@ -732,7 +735,7 @@ void gs_shader_set_val(gs_sparam_t *param, const void *val, size_t size)
 	if (!count)
 		count = 1;
 
-	switch ((uint32_t)param->type) {
+	switch (param->type) {
 	case GS_SHADER_PARAM_FLOAT:
 		expected_size = sizeof(float);
 		break;

@@ -49,7 +49,7 @@ MissingFilesPathItemDelegate::MissingFilesPathItemDelegate(
 
 QWidget *MissingFilesPathItemDelegate::createEditor(
 	QWidget *parent, const QStyleOptionViewItem & /* option */,
-	const QModelIndex &index) const
+	const QModelIndex &) const
 {
 	QSizePolicy buttonSizePolicy(QSizePolicy::Policy::Minimum,
 				     QSizePolicy::Policy::Expanding,
@@ -98,8 +98,6 @@ QWidget *MissingFilesPathItemDelegate::createEditor(
 
 	container->setLayout(layout);
 	container->setFocusProxy(text);
-
-	UNUSED_PARAMETER(index);
 
 	return container;
 }
@@ -165,6 +163,11 @@ void MissingFilesPathItemDelegate::handleBrowse(QWidget *container)
 		QString newPath = QFileDialog::getOpenFileName(
 			container, QTStr("MissingFiles.SelectFile"),
 			currentPath, nullptr);
+
+#ifdef __APPLE__
+		// TODO: Revisit when QTBUG-42661 is fixed
+		container->window()->raise();
+#endif
 
 		if (!newPath.isEmpty()) {
 			container->setProperty(PATH_LIST_PROP,
@@ -265,13 +268,11 @@ QVariant MissingFilesModel::data(const QModelIndex &index, int role) const
 		   index.column() == MissingFilesColumn::Source) {
 		OBSBasic *main =
 			reinterpret_cast<OBSBasic *>(App()->GetMainWindow());
-		obs_source_t *source = obs_get_source_by_name(
+		OBSSourceAutoRelease source = obs_get_source_by_name(
 			files[index.row()].source.toStdString().c_str());
 
 		if (source) {
 			result = main->GetSourceIcon(obs_source_get_id(source));
-
-			obs_source_release(source);
 		}
 	} else if (role == Qt::FontRole &&
 		   index.column() == MissingFilesColumn::State) {
@@ -495,9 +496,10 @@ OBSMissingFiles::OBSMissingFiles(obs_missing_files_t *files, QWidget *parent)
 		addMissingFile(oldPath, name);
 	}
 
-	QString found = QTStr("MissingFiles.NumFound");
-	found.replace("$1", "0");
-	found.replace("$2", QString::number(obs_missing_files_count(files)));
+	QString found =
+		QTStr("MissingFiles.NumFound")
+			.arg("0",
+			     QString::number(obs_missing_files_count(files)));
 
 	ui->found->setText(found);
 
@@ -575,10 +577,10 @@ void OBSMissingFiles::browseFolders()
 
 void OBSMissingFiles::dataChanged()
 {
-	QString found = QTStr("MissingFiles.NumFound");
-	found.replace("$1", QString::number(filesModel->found()));
-	found.replace("$2",
-		      QString::number(obs_missing_files_count(fileStore)));
+	QString found = QTStr("MissingFiles.NumFound")
+				.arg(QString::number(filesModel->found()),
+				     QString::number(obs_missing_files_count(
+					     fileStore)));
 
 	ui->found->setText(found);
 

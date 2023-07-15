@@ -3,7 +3,7 @@
 #include <util/util.hpp>
 #include <obs-module.h>
 #include <sys/stat.h>
-#include <windows.h>
+#include <combaseapi.h>
 #include <gdiplus.h>
 #include <algorithm>
 #include <string>
@@ -83,9 +83,6 @@ using namespace Gdiplus;
 #define S_TRANSFORM_UPPERCASE           1
 #define S_TRANSFORM_LOWERCASE           2
 #define S_TRANSFORM_STARTCASE           3
-
-#define S_ANTIALIASING_NONE             0
-#define S_ANTIALIASING_STANDARD         1
 
 #define T_(v)                           obs_module_text(v)
 #define T_FONT                          T_("Font")
