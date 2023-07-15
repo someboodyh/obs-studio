@@ -27,8 +27,6 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 	uint32_t flags = obs_source_get_flags(source);
 	uint32_t mixers = obs_source_get_audio_mixers(source);
 
-	activeContainer = new QWidget();
-	forceMonoContainer = new QWidget();
 	mixerContainer = new QWidget();
 	balanceContainer = new QWidget();
 	labelL = new QLabel();
@@ -41,9 +39,8 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 	percent = new QSpinBox();
 	forceMono = new QCheckBox();
 	balance = new BalanceSlider();
-#if defined(_WIN32) || defined(__APPLE__) || HAVE_PULSEAUDIO
-	monitoringType = new QComboBox();
-#endif
+	if (obs_audio_monitoring_available())
+		monitoringType = new QComboBox();
 	syncOffset = new QSpinBox();
 	mixer1 = new QCheckBox();
 	mixer2 = new QCheckBox();
@@ -61,15 +58,16 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 				 this);
 	flagsSignal.Connect(handler, "update_flags", OBSSourceFlagsChanged,
 			    this);
+	if (obs_audio_monitoring_available())
+		monitoringTypeSignal.Connect(handler, "audio_monitoring",
+					     OBSSourceMonitoringTypeChanged,
+					     this);
 	mixersSignal.Connect(handler, "audio_mixers", OBSSourceMixersChanged,
 			     this);
+	balChangedSignal.Connect(handler, "audio_balance",
+				 OBSSourceBalanceChanged, this);
+	renameSignal.Connect(handler, "rename", OBSSourceRenamed, this);
 
-	hlayout = new QHBoxLayout();
-	hlayout->setContentsMargins(0, 0, 0, 0);
-	activeContainer->setLayout(hlayout);
-	hlayout = new QHBoxLayout();
-	hlayout->setContentsMargins(0, 0, 0, 0);
-	forceMonoContainer->setLayout(hlayout);
 	hlayout = new QHBoxLayout();
 	hlayout->setContentsMargins(0, 0, 0, 0);
 	mixerContainer->setLayout(hlayout);
@@ -79,7 +77,6 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 	balanceContainer->setFixedWidth(150);
 
 	labelL->setText("L");
-
 	labelR->setText("R");
 
 	OBSBasic *main = reinterpret_cast<OBSBasic *>(App()->GetMainWindow());
@@ -90,7 +87,7 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 	iconLabel->setFixedSize(16, 16);
 	iconLabel->setStyleSheet("background: none");
 
-	nameLabel->setText(sourceName);
+	SetSourceName(sourceName);
 	nameLabel->setAlignment(Qt::AlignVCenter);
 
 	bool isActive = obs_source_active(source);
@@ -98,9 +95,7 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 				 : QTStr("Basic.Stats.Status.Inactive"));
 	if (isActive)
 		setThemeID(active, "error");
-	activeContainer->layout()->addWidget(active);
-	activeContainer->layout()->setAlignment(active, Qt::AlignVCenter);
-	activeContainer->setFixedWidth(120);
+	active->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
 
 	volume->setMinimum(MIN_DB - 0.1);
 	volume->setMaximum(MAX_DB);
@@ -108,7 +103,6 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 	volume->setDecimals(1);
 	volume->setSuffix(" dB");
 	volume->setValue(obs_mul_to_db(vol));
-	volume->setFixedWidth(100);
 	volume->setAccessibleName(
 		QTStr("Basic.AdvAudio.VolumeSource").arg(sourceName));
 
@@ -121,10 +115,11 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 	percent->setMaximum(2000);
 	percent->setSuffix("%");
 	percent->setValue((int)(obs_source_get_volume(source) * 100.0f));
-	percent->setFixedWidth(100);
 	percent->setAccessibleName(
 		QTStr("Basic.AdvAudio.VolumeSource").arg(sourceName));
 
+	stackedWidget->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
+	stackedWidget->setFixedWidth(100);
 	stackedWidget->addWidget(volume);
 	stackedWidget->addWidget(percent);
 
@@ -133,13 +128,10 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 
 	SetVolumeWidget(volType);
 
+	forceMono->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
 	forceMono->setChecked((flags & OBS_SOURCE_FLAG_FORCE_MONO) != 0);
 	forceMono->setAccessibleName(
 		QTStr("Basic.AdvAudio.MonoSource").arg(sourceName));
-
-	forceMonoContainer->layout()->addWidget(forceMono);
-	forceMonoContainer->layout()->setAlignment(forceMono, Qt::AlignVCenter);
-	forceMonoContainer->setFixedWidth(50);
 
 	balance->setOrientation(Qt::Horizontal);
 	balance->setMinimum(0);
@@ -170,19 +162,24 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 		QTStr("Basic.AdvAudio.SyncOffsetSource").arg(sourceName));
 
 	int idx;
-#if defined(_WIN32) || defined(__APPLE__) || HAVE_PULSEAUDIO
-	monitoringType->addItem(QTStr("Basic.AdvAudio.Monitoring.None"),
-				(int)OBS_MONITORING_TYPE_NONE);
-	monitoringType->addItem(QTStr("Basic.AdvAudio.Monitoring.MonitorOnly"),
-				(int)OBS_MONITORING_TYPE_MONITOR_ONLY);
-	monitoringType->addItem(QTStr("Basic.AdvAudio.Monitoring.Both"),
-				(int)OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT);
-	int mt = (int)obs_source_get_monitoring_type(source);
-	idx = monitoringType->findData(mt);
-	monitoringType->setCurrentIndex(idx);
-	monitoringType->setAccessibleName(
-		QTStr("Basic.AdvAudio.MonitoringSource").arg(sourceName));
-#endif
+	if (obs_audio_monitoring_available()) {
+		monitoringType->addItem(QTStr("Basic.AdvAudio.Monitoring.None"),
+					(int)OBS_MONITORING_TYPE_NONE);
+		monitoringType->addItem(
+			QTStr("Basic.AdvAudio.Monitoring.MonitorOnly"),
+			(int)OBS_MONITORING_TYPE_MONITOR_ONLY);
+		monitoringType->addItem(
+			QTStr("Basic.AdvAudio.Monitoring.Both"),
+			(int)OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT);
+		int mt = (int)obs_source_get_monitoring_type(source);
+		idx = monitoringType->findData(mt);
+		monitoringType->setCurrentIndex(idx);
+		monitoringType->setAccessibleName(
+			QTStr("Basic.AdvAudio.MonitoringSource")
+				.arg(sourceName));
+		monitoringType->setSizePolicy(QSizePolicy::Maximum,
+					      QSizePolicy::Fixed);
+	}
 
 	mixer1->setText("1");
 	mixer1->setChecked(mixers & (1 << 0));
@@ -209,14 +206,14 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 	mixer6->setAccessibleName(
 		QTStr("Basic.Settings.Output.Adv.Audio.Track6"));
 
+	balanceContainer->layout()->addWidget(labelL);
+	balanceContainer->layout()->addWidget(balance);
+	balanceContainer->layout()->addWidget(labelR);
+
 	speaker_layout sl = obs_source_get_speaker_layout(source);
 
-	if (sl == SPEAKERS_STEREO) {
-		balanceContainer->layout()->addWidget(labelL);
-		balanceContainer->layout()->addWidget(balance);
-		balanceContainer->layout()->addWidget(labelR);
-		balanceContainer->setMaximumWidth(170);
-	}
+	if (sl != SPEAKERS_STEREO)
+		balanceContainer->setEnabled(false);
 
 	mixerContainer->layout()->addWidget(mixer1);
 	mixerContainer->layout()->addWidget(mixer2);
@@ -224,6 +221,7 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 	mixerContainer->layout()->addWidget(mixer4);
 	mixerContainer->layout()->addWidget(mixer5);
 	mixerContainer->layout()->addWidget(mixer6);
+	mixerContainer->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
 
 	QWidget::connect(volume, SIGNAL(valueChanged(double)), this,
 			 SLOT(volumeChanged(double)));
@@ -237,10 +235,10 @@ OBSAdvAudioCtrl::OBSAdvAudioCtrl(QGridLayout *, obs_source_t *source_)
 			 SLOT(ResetBalance()));
 	QWidget::connect(syncOffset, SIGNAL(valueChanged(int)), this,
 			 SLOT(syncOffsetChanged(int)));
-#if defined(_WIN32) || defined(__APPLE__) || HAVE_PULSEAUDIO
-	QWidget::connect(monitoringType, SIGNAL(currentIndexChanged(int)), this,
-			 SLOT(monitoringTypeChanged(int)));
-#endif
+	if (obs_audio_monitoring_available())
+		QWidget::connect(monitoringType,
+				 SIGNAL(currentIndexChanged(int)), this,
+				 SLOT(monitoringTypeChanged(int)));
 	QWidget::connect(mixer1, SIGNAL(clicked(bool)), this,
 			 SLOT(mixer1Changed(bool)));
 	QWidget::connect(mixer2, SIGNAL(clicked(bool)), this,
@@ -261,14 +259,13 @@ OBSAdvAudioCtrl::~OBSAdvAudioCtrl()
 {
 	iconLabel->deleteLater();
 	nameLabel->deleteLater();
-	activeContainer->deleteLater();
+	active->deleteLater();
 	stackedWidget->deleteLater();
-	forceMonoContainer->deleteLater();
+	forceMono->deleteLater();
 	balanceContainer->deleteLater();
 	syncOffset->deleteLater();
-#if defined(_WIN32) || defined(__APPLE__) || HAVE_PULSEAUDIO
-	monitoringType->deleteLater();
-#endif
+	if (obs_audio_monitoring_available())
+		monitoringType->deleteLater();
 	mixerContainer->deleteLater();
 }
 
@@ -279,14 +276,13 @@ void OBSAdvAudioCtrl::ShowAudioControl(QGridLayout *layout)
 
 	layout->addWidget(iconLabel, lastRow, idx++);
 	layout->addWidget(nameLabel, lastRow, idx++);
-	layout->addWidget(activeContainer, lastRow, idx++);
+	layout->addWidget(active, lastRow, idx++);
 	layout->addWidget(stackedWidget, lastRow, idx++);
-	layout->addWidget(forceMonoContainer, lastRow, idx++);
+	layout->addWidget(forceMono, lastRow, idx++);
 	layout->addWidget(balanceContainer, lastRow, idx++);
 	layout->addWidget(syncOffset, lastRow, idx++);
-#if defined(_WIN32) || defined(__APPLE__) || HAVE_PULSEAUDIO
-	layout->addWidget(monitoringType, lastRow, idx++);
-#endif
+	if (obs_audio_monitoring_available())
+		layout->addWidget(monitoringType, lastRow, idx++);
 	layout->addWidget(mixerContainer, lastRow, idx++);
 	layout->layout()->setAlignment(mixerContainer, Qt::AlignVCenter);
 	layout->setHorizontalSpacing(15);
@@ -295,18 +291,16 @@ void OBSAdvAudioCtrl::ShowAudioControl(QGridLayout *layout)
 /* ------------------------------------------------------------------------- */
 /* OBS source callbacks */
 
-void OBSAdvAudioCtrl::OBSSourceActivated(void *param, calldata_t *calldata)
+void OBSAdvAudioCtrl::OBSSourceActivated(void *param, calldata_t *)
 {
 	QMetaObject::invokeMethod(reinterpret_cast<OBSAdvAudioCtrl *>(param),
 				  "SourceActiveChanged", Q_ARG(bool, true));
-	UNUSED_PARAMETER(calldata);
 }
 
-void OBSAdvAudioCtrl::OBSSourceDeactivated(void *param, calldata_t *calldata)
+void OBSAdvAudioCtrl::OBSSourceDeactivated(void *param, calldata_t *)
 {
 	QMetaObject::invokeMethod(reinterpret_cast<OBSAdvAudioCtrl *>(param),
 				  "SourceActiveChanged", Q_ARG(bool, false));
-	UNUSED_PARAMETER(calldata);
 }
 
 void OBSAdvAudioCtrl::OBSSourceFlagsChanged(void *param, calldata_t *calldata)
@@ -330,12 +324,36 @@ void OBSAdvAudioCtrl::OBSSourceSyncChanged(void *param, calldata_t *calldata)
 				  "SourceSyncChanged", Q_ARG(int64_t, offset));
 }
 
+void OBSAdvAudioCtrl::OBSSourceMonitoringTypeChanged(void *param,
+						     calldata_t *calldata)
+{
+	int type = calldata_int(calldata, "type");
+	QMetaObject::invokeMethod(reinterpret_cast<OBSAdvAudioCtrl *>(param),
+				  "SourceMonitoringTypeChanged",
+				  Q_ARG(int, type));
+}
+
 void OBSAdvAudioCtrl::OBSSourceMixersChanged(void *param, calldata_t *calldata)
 {
 	uint32_t mixers = (uint32_t)calldata_int(calldata, "mixers");
 	QMetaObject::invokeMethod(reinterpret_cast<OBSAdvAudioCtrl *>(param),
 				  "SourceMixersChanged",
 				  Q_ARG(uint32_t, mixers));
+}
+
+void OBSAdvAudioCtrl::OBSSourceBalanceChanged(void *param, calldata_t *calldata)
+{
+	int balance = (float)calldata_float(calldata, "balance") * 100.0f;
+	QMetaObject::invokeMethod(reinterpret_cast<OBSAdvAudioCtrl *>(param),
+				  "SourceBalanceChanged", Q_ARG(int, balance));
+}
+
+void OBSAdvAudioCtrl::OBSSourceRenamed(void *param, calldata_t *calldata)
+{
+	QString newName = QT_UTF8(calldata_string(calldata, "new_name"));
+
+	QMetaObject::invokeMethod(reinterpret_cast<OBSAdvAudioCtrl *>(param),
+				  "SetSourceName", Q_ARG(QString, newName));
 }
 
 /* ------------------------------------------------------------------------- */
@@ -375,11 +393,26 @@ void OBSAdvAudioCtrl::SourceVolumeChanged(float value)
 	volume->blockSignals(false);
 }
 
+void OBSAdvAudioCtrl::SourceBalanceChanged(int value)
+{
+	balance->blockSignals(true);
+	balance->setValue(value);
+	balance->blockSignals(false);
+}
+
 void OBSAdvAudioCtrl::SourceSyncChanged(int64_t offset)
 {
 	syncOffset->blockSignals(true);
 	syncOffset->setValue(offset / NSEC_PER_MSEC);
 	syncOffset->blockSignals(false);
+}
+
+void OBSAdvAudioCtrl::SourceMonitoringTypeChanged(int type)
+{
+	int idx = monitoringType->findData(type);
+	monitoringType->blockSignals(true);
+	monitoringType->setCurrentIndex(idx);
+	monitoringType->blockSignals(false);
 }
 
 void OBSAdvAudioCtrl::SourceMixersChanged(uint32_t mixers)
@@ -407,19 +440,19 @@ void OBSAdvAudioCtrl::volumeChanged(double db)
 	float val = obs_db_to_mul(db);
 	obs_source_set_volume(source, val);
 
-	auto undo_redo = [](const std::string &name, float val) {
-		obs_source_t *source = obs_get_source_by_name(name.c_str());
+	auto undo_redo = [](const std::string &uuid, float val) {
+		OBSSourceAutoRelease source =
+			obs_get_source_by_uuid(uuid.c_str());
 		obs_source_set_volume(source, val);
-		obs_source_release(source);
 	};
 
 	const char *name = obs_source_get_name(source);
-
+	const char *uuid = obs_source_get_uuid(source);
 	OBSBasic *main = OBSBasic::Get();
 	main->undo_s.add_action(
 		QTStr("Undo.Volume.Change").arg(name),
 		std::bind(undo_redo, std::placeholders::_1, prev),
-		std::bind(undo_redo, std::placeholders::_1, val), name, name,
+		std::bind(undo_redo, std::placeholders::_1, val), uuid, uuid,
 		true);
 }
 
@@ -430,17 +463,18 @@ void OBSAdvAudioCtrl::percentChanged(int percent)
 
 	obs_source_set_volume(source, val);
 
-	auto undo_redo = [](const std::string &name, float val) {
-		obs_source_t *source = obs_get_source_by_name(name.c_str());
+	auto undo_redo = [](const std::string &uuid, float val) {
+		OBSSourceAutoRelease source =
+			obs_get_source_by_uuid(uuid.c_str());
 		obs_source_set_volume(source, val);
-		obs_source_release(source);
 	};
 
 	const char *name = obs_source_get_name(source);
+	const char *uuid = obs_source_get_uuid(source);
 	OBSBasic::Get()->undo_s.add_action(
 		QTStr("Undo.Volume.Change").arg(name),
 		std::bind(undo_redo, std::placeholders::_1, prev),
-		std::bind(undo_redo, std::placeholders::_1, val), name, name,
+		std::bind(undo_redo, std::placeholders::_1, val), uuid, uuid,
 		true);
 }
 
@@ -469,19 +503,20 @@ void OBSAdvAudioCtrl::downmixMonoChanged(bool val)
 
 	obs_source_set_flags(source, flags);
 
-	auto undo_redo = [](const std::string &name, bool val) {
-		obs_source_t *source = obs_get_source_by_name(name.c_str());
+	auto undo_redo = [](const std::string &uuid, bool val) {
+		OBSSourceAutoRelease source =
+			obs_get_source_by_uuid(uuid.c_str());
 		set_mono(source, val);
-		obs_source_release(source);
 	};
 
 	QString text = QTStr(val ? "Undo.ForceMono.On" : "Undo.ForceMono.Off");
 
 	const char *name = obs_source_get_name(source);
+	const char *uuid = obs_source_get_uuid(source);
 	OBSBasic::Get()->undo_s.add_action(
 		text.arg(name),
 		std::bind(undo_redo, std::placeholders::_1, !val),
-		std::bind(undo_redo, std::placeholders::_1, val), name, name);
+		std::bind(undo_redo, std::placeholders::_1, val), uuid, uuid);
 }
 
 void OBSAdvAudioCtrl::balanceChanged(int val)
@@ -498,17 +533,18 @@ void OBSAdvAudioCtrl::balanceChanged(int val)
 
 	obs_source_set_balance_value(source, bal);
 
-	auto undo_redo = [](const std::string &name, float val) {
-		obs_source_t *source = obs_get_source_by_name(name.c_str());
+	auto undo_redo = [](const std::string &uuid, float val) {
+		OBSSourceAutoRelease source =
+			obs_get_source_by_uuid(uuid.c_str());
 		obs_source_set_balance_value(source, val);
-		obs_source_release(source);
 	};
 
 	const char *name = obs_source_get_name(source);
+	const char *uuid = obs_source_get_uuid(source);
 	OBSBasic::Get()->undo_s.add_action(
 		QTStr("Undo.Balance.Change").arg(name),
 		std::bind(undo_redo, std::placeholders::_1, prev),
-		std::bind(undo_redo, std::placeholders::_1, bal), name, name,
+		std::bind(undo_redo, std::placeholders::_1, bal), uuid, uuid,
 		true);
 }
 
@@ -527,17 +563,18 @@ void OBSAdvAudioCtrl::syncOffsetChanged(int milliseconds)
 
 	obs_source_set_sync_offset(source, val);
 
-	auto undo_redo = [](const std::string &name, int64_t val) {
-		obs_source_t *source = obs_get_source_by_name(name.c_str());
+	auto undo_redo = [](const std::string &uuid, int64_t val) {
+		OBSSourceAutoRelease source =
+			obs_get_source_by_uuid(uuid.c_str());
 		obs_source_set_sync_offset(source, val);
-		obs_source_release(source);
 	};
 
 	const char *name = obs_source_get_name(source);
+	const char *uuid = obs_source_get_uuid(source);
 	OBSBasic::Get()->undo_s.add_action(
 		QTStr("Undo.SyncOffset.Change").arg(name),
 		std::bind(undo_redo, std::placeholders::_1, prev),
-		std::bind(undo_redo, std::placeholders::_1, val), name, name,
+		std::bind(undo_redo, std::placeholders::_1, val), uuid, uuid,
 		true);
 }
 
@@ -567,16 +604,17 @@ void OBSAdvAudioCtrl::monitoringTypeChanged(int index)
 	blog(LOG_INFO, "User changed audio monitoring for source '%s' to: %s",
 	     name ? name : "(null)", type);
 
-	auto undo_redo = [](const std::string &name, obs_monitoring_type val) {
-		obs_source_t *source = obs_get_source_by_name(name.c_str());
+	auto undo_redo = [](const std::string &uuid, obs_monitoring_type val) {
+		OBSSourceAutoRelease source =
+			obs_get_source_by_uuid(uuid.c_str());
 		obs_source_set_monitoring_type(source, val);
-		obs_source_release(source);
 	};
 
+	const char *uuid = obs_source_get_uuid(source);
 	OBSBasic::Get()->undo_s.add_action(
 		QTStr("Undo.MonitoringType.Change").arg(name),
 		std::bind(undo_redo, std::placeholders::_1, prev),
-		std::bind(undo_redo, std::placeholders::_1, mt), name, name);
+		std::bind(undo_redo, std::placeholders::_1, mt), uuid, uuid);
 }
 
 static inline void setMixer(obs_source_t *source, const int mixerIdx,
@@ -592,18 +630,19 @@ static inline void setMixer(obs_source_t *source, const int mixerIdx,
 
 	obs_source_set_audio_mixers(source, new_mixers);
 
-	auto undo_redo = [](const std::string &name, uint32_t mixers) {
-		obs_source_t *source = obs_get_source_by_name(name.c_str());
+	auto undo_redo = [](const std::string &uuid, uint32_t mixers) {
+		OBSSourceAutoRelease source =
+			obs_get_source_by_uuid(uuid.c_str());
 		obs_source_set_audio_mixers(source, mixers);
-		obs_source_release(source);
 	};
 
 	const char *name = obs_source_get_name(source);
+	const char *uuid = obs_source_get_uuid(source);
 	OBSBasic::Get()->undo_s.add_action(
 		QTStr("Undo.Mixers.Change").arg(name),
 		std::bind(undo_redo, std::placeholders::_1, mixers),
-		std::bind(undo_redo, std::placeholders::_1, new_mixers), name,
-		name);
+		std::bind(undo_redo, std::placeholders::_1, new_mixers), uuid,
+		uuid);
 }
 
 void OBSAdvAudioCtrl::mixer1Changed(bool checked)
@@ -651,4 +690,9 @@ void OBSAdvAudioCtrl::SetVolumeWidget(VolumeType type)
 void OBSAdvAudioCtrl::SetIconVisible(bool visible)
 {
 	visible ? iconLabel->show() : iconLabel->hide();
+}
+
+void OBSAdvAudioCtrl::SetSourceName(QString newName)
+{
+	TruncateLabel(nameLabel, newName);
 }

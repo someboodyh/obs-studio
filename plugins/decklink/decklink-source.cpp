@@ -87,9 +87,8 @@ static void decklink_update(void *data, obs_data_t *settings)
 static void decklink_show(void *data)
 {
 	DeckLinkInput *decklink = (DeckLinkInput *)data;
-	obs_source_t *source = decklink->GetSource();
-	bool showing = obs_source_showing(source);
-	if (decklink->dwns && showing && !decklink->Capturing()) {
+
+	if (decklink->dwns && !decklink->Capturing()) {
 		ComPtr<DeckLinkDevice> device;
 		device.Set(deviceEnum->FindByHash(decklink->hash.c_str()));
 		decklink->Activate(device, decklink->id,
@@ -100,9 +99,8 @@ static void decklink_show(void *data)
 static void decklink_hide(void *data)
 {
 	DeckLinkInput *decklink = (DeckLinkInput *)data;
-	obs_source_t *source = decklink->GetSource();
-	bool showing = obs_source_showing(source);
-	if (decklink->dwns && showing)
+
+	if (decklink->dwns && decklink->Capturing())
 		decklink->Deactivate();
 }
 
@@ -289,8 +287,9 @@ static obs_properties_t *decklink_get_properties(void *data)
 				       OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(list, TEXT_COLOR_SPACE_DEFAULT,
 				  VIDEO_CS_DEFAULT);
-	obs_property_list_add_int(list, "BT.601", VIDEO_CS_601);
-	obs_property_list_add_int(list, "BT.709", VIDEO_CS_709);
+	obs_property_list_add_int(list, "Rec. 601", VIDEO_CS_601);
+	obs_property_list_add_int(list, "Rec. 709", VIDEO_CS_709);
+	obs_property_list_add_int(list, "Rec. 2020", VIDEO_CS_2100_PQ);
 
 	list = obs_properties_add_list(props, COLOR_RANGE, TEXT_COLOR_RANGE,
 				       OBS_COMBO_TYPE_LIST,

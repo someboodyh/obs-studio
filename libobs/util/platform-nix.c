@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013 Hugh Bailey <obs.jim@gmail.com>
+ * Copyright (c) 2023 Lain Bailey <lain@obsproject.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,6 +14,14 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include "obsconfig.h"
+
+#if !defined(__APPLE__) && OBS_QT_VERSION == 6
+#define _GNU_SOURCE
+#include <link.h>
+#include <stdlib.h>
+#endif
+
 #include <stdio.h>
 #include <errno.h>
 #include <sys/types.h>
@@ -27,8 +35,7 @@
 #include <glob.h>
 #include <time.h>
 #include <signal.h>
-
-#include "obsconfig.h"
+#include <uuid/uuid.h>
 
 #if !defined(__APPLE__)
 #include <sys/times.h>
@@ -47,6 +54,9 @@
 #else
 #include <sys/resource.h>
 #endif
+#if !defined(__OpenBSD__)
+#include <sys/sysinfo.h>
+#endif
 #include <spawn.h>
 #endif
 
@@ -64,7 +74,9 @@ void *os_dlopen(const char *path)
 
 	dstr_init_copy(&dylib_name, path);
 #ifdef __APPLE__
-	if (!dstr_find(&dylib_name, ".so") && !dstr_find(&dylib_name, ".dylib"))
+	if (!dstr_find(&dylib_name, ".framework") &&
+	    !dstr_find(&dylib_name, ".plugin") &&
+	    !dstr_find(&dylib_name, ".dylib") && !dstr_find(&dylib_name, ".so"))
 #else
 	if (!dstr_find(&dylib_name, ".so"))
 #endif
@@ -92,6 +104,53 @@ void os_dlclose(void *module)
 {
 	if (module)
 		dlclose(module);
+}
+
+#if !defined(__APPLE__) && OBS_QT_VERSION == 6
+int module_has_qt5_check(const char *path)
+{
+	void *mod = os_dlopen(path);
+	if (mod == NULL) {
+		return 1;
+	}
+
+	struct link_map *list = NULL;
+	if (dlinfo(mod, RTLD_DI_LINKMAP, &list) == 0) {
+		for (struct link_map *ptr = list; ptr; ptr = ptr->l_next) {
+			if (strstr(ptr->l_name, "libQt5") != NULL) {
+				return 0;
+			}
+		}
+	}
+
+	return 1;
+}
+
+bool has_qt5_dependency(const char *path)
+{
+	pid_t pid = fork();
+	if (pid == 0) {
+		_exit(module_has_qt5_check(path));
+	}
+	if (pid < 0) {
+		return false;
+	}
+	int status;
+	if (waitpid(pid, &status, 0) < 0) {
+		return false;
+	}
+	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+#endif
+
+void get_plugin_info(const char *path, bool *is_obs_plugin, bool *can_load)
+{
+	*is_obs_plugin = true;
+	*can_load = true;
+#if !defined(__APPLE__) && OBS_QT_VERSION == 6
+	*can_load = !has_qt5_dependency(path);
+#endif
+	UNUSED_PARAMETER(path);
 }
 
 bool os_is_obs_plugin(const char *path)
@@ -174,6 +233,23 @@ bool os_sleepto_ns(uint64_t time_target)
 		req = remain;
 		memset(&remain, 0, sizeof(remain));
 	}
+
+	return true;
+}
+
+bool os_sleepto_ns_fast(uint64_t time_target)
+{
+	uint64_t current = os_gettime_ns();
+	if (time_target < current)
+		return false;
+
+	do {
+		uint64_t remain_us = (time_target - current + 999) / 1000;
+		useconds_t us = remain_us >= 1000000 ? 999999 : remain_us;
+		usleep(us);
+
+		current = os_gettime_ns();
+	} while (time_target > current);
 
 	return true;
 }
@@ -380,6 +456,11 @@ char *os_get_executable_path_ptr(const char *name)
 	}
 
 	return path.array;
+}
+
+bool os_get_emulation_status(void)
+{
+	return false;
 }
 
 #endif
@@ -629,18 +710,25 @@ int os_chdir(const char *path)
 
 #if !defined(__APPLE__)
 
-#if HAVE_DBUS
+#if defined(GIO_FOUND)
 struct dbus_sleep_info;
+struct portal_inhibit_info;
 
 extern struct dbus_sleep_info *dbus_sleep_info_create(void);
 extern void dbus_inhibit_sleep(struct dbus_sleep_info *dbus, const char *sleep,
 			       bool active);
 extern void dbus_sleep_info_destroy(struct dbus_sleep_info *dbus);
+
+extern struct portal_inhibit_info *portal_inhibit_info_create(void);
+extern void portal_inhibit(struct portal_inhibit_info *portal,
+			   const char *reason, bool active);
+extern void portal_inhibit_info_destroy(struct portal_inhibit_info *portal);
 #endif
 
 struct os_inhibit_info {
-#if HAVE_DBUS
+#if defined(GIO_FOUND)
 	struct dbus_sleep_info *dbus;
+	struct portal_inhibit_info *portal;
 #endif
 	pthread_t screensaver_thread;
 	os_event_t *stop_event;
@@ -654,8 +742,10 @@ os_inhibit_t *os_inhibit_sleep_create(const char *reason)
 	struct os_inhibit_info *info = bzalloc(sizeof(*info));
 	sigset_t set;
 
-#if HAVE_DBUS
-	info->dbus = dbus_sleep_info_create();
+#if defined(GIO_FOUND)
+	info->portal = portal_inhibit_info_create();
+	if (!info->portal)
+		info->dbus = dbus_sleep_info_create();
 #endif
 
 	os_event_init(&info->stop_event, OS_EVENT_TYPE_AUTO);
@@ -709,7 +799,9 @@ bool os_inhibit_sleep_set_active(os_inhibit_t *info, bool active)
 	if (info->active == active)
 		return false;
 
-#if HAVE_DBUS
+#if defined(GIO_FOUND)
+	if (info->portal)
+		portal_inhibit(info->portal, info->reason, active);
 	if (info->dbus)
 		dbus_inhibit_sleep(info->dbus, info->reason, active);
 #endif
@@ -738,7 +830,8 @@ void os_inhibit_sleep_destroy(os_inhibit_t *info)
 {
 	if (info) {
 		os_inhibit_sleep_set_active(info, false);
-#if HAVE_DBUS
+#if defined(GIO_FOUND)
+		portal_inhibit_info_destroy(info->portal);
 		dbus_sleep_info_destroy(info->dbus);
 #endif
 		os_event_destroy(info->stop_event);
@@ -989,7 +1082,8 @@ bool os_get_proc_memory_usage(os_proc_memory_usage_t *usage)
 	if (!os_get_proc_memory_usage_internal(&statm))
 		return false;
 
-	usage->resident_size = statm.resident_size;
+	usage->resident_size =
+		(uint64_t)statm.resident_size * sysconf(_SC_PAGESIZE);
 	usage->virtual_size = statm.virtual_size;
 	return true;
 }
@@ -999,7 +1093,7 @@ uint64_t os_get_proc_resident_size(void)
 	statm_t statm = {};
 	if (!os_get_proc_memory_usage_internal(&statm))
 		return 0;
-	return (uint64_t)statm.resident_size;
+	return (uint64_t)statm.resident_size * sysconf(_SC_PAGESIZE);
 }
 
 uint64_t os_get_proc_virtual_size(void)
@@ -1010,6 +1104,30 @@ uint64_t os_get_proc_virtual_size(void)
 	return (uint64_t)statm.virtual_size;
 }
 #endif
+
+static uint64_t total_memory = 0;
+static bool total_memory_initialized = false;
+
+static void os_get_sys_total_size_internal()
+{
+	total_memory_initialized = true;
+
+#ifndef __OpenBSD__
+	struct sysinfo info;
+	if (sysinfo(&info) < 0)
+		return;
+
+	total_memory = (uint64_t)info.totalram * info.mem_unit;
+#endif
+}
+
+uint64_t os_get_sys_total_size(void)
+{
+	if (!total_memory_initialized)
+		os_get_sys_total_size_internal();
+
+	return total_memory;
+}
 #endif
 
 uint64_t os_get_free_disk_space(const char *dir)
@@ -1019,4 +1137,14 @@ uint64_t os_get_free_disk_space(const char *dir)
 		return 0;
 
 	return (uint64_t)info.f_frsize * (uint64_t)info.f_bavail;
+}
+
+char *os_generate_uuid(void)
+{
+	uuid_t uuid;
+	// 36 char UUID + NULL
+	char *out = bmalloc(37);
+	uuid_generate(uuid);
+	uuid_unparse_lower(uuid, out);
+	return out;
 }

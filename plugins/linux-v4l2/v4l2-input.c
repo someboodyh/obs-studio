@@ -37,6 +37,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "v4l2-controls.h"
 #include "v4l2-helpers.h"
+#include "v4l2-decoder.h"
+
+#define FALLBACK_FRAMERATE 30
 
 #if HAVE_UDEV
 #include "v4l2-udev.h"
@@ -80,6 +83,7 @@ struct v4l2_data {
 	obs_source_t *source;
 	pthread_t thread;
 	os_event_t *event;
+	struct v4l2_decoder decoder;
 
 	bool framerate_unchanged;
 	bool resolution_unchanged;
@@ -100,6 +104,8 @@ static void v4l2_update(void *vptr, obs_data_t *settings);
 
 /**
  * Prepare the output frame structure for obs and compute plane offsets
+ * For encoded formats (mjpeg) this clears the frame and plane offsets,
+ * which will be filled in after decoding.
  *
  * Basically all data apart from memory pointers and the timestamp is known
  * before the capture starts. This function prepares the obs_source_frame
@@ -108,6 +114,7 @@ static void v4l2_update(void *vptr, obs_data_t *settings);
  * v4l2 uses a continuous memory segment for all planes so we simply compute
  * offsets to add to the start address in order to give obs the correct data
  * pointers for the individual planes.
+ *
  */
 static void v4l2_prep_obs_frame(struct v4l2_data *data,
 				struct obs_source_frame *frame,
@@ -116,12 +123,16 @@ static void v4l2_prep_obs_frame(struct v4l2_data *data,
 	memset(frame, 0, sizeof(struct obs_source_frame));
 	memset(plane_offsets, 0, sizeof(size_t) * MAX_AV_PLANES);
 
+	const enum video_format format = v4l2_to_obs_video_format(data->pixfmt);
+
 	frame->width = data->width;
 	frame->height = data->height;
-	frame->format = v4l2_to_obs_video_format(data->pixfmt);
-	video_format_get_parameters(VIDEO_CS_DEFAULT, data->color_range,
-				    frame->color_matrix, frame->color_range_min,
-				    frame->color_range_max);
+	frame->format = format;
+	video_format_get_parameters_for_format(VIDEO_CS_DEFAULT,
+					       data->color_range, format,
+					       frame->color_matrix,
+					       frame->color_range_min,
+					       frame->color_range_max);
 
 	switch (data->pixfmt) {
 	case V4L2_PIX_FMT_NV12:
@@ -177,7 +188,8 @@ static void *v4l2_thread(void *vptr)
 	blog(LOG_DEBUG, "%s: framerate: %.2f fps", data->device_id, ffps);
 	/* Timeout set to 5 frame periods. */
 	timeout_usec = (1000000 * data->timeout_frames) / ffps;
-	blog(LOG_INFO, "%s: select timeout set to %ldus (%dx frame periods)",
+	blog(LOG_INFO,
+	     "%s: select timeout set to %" PRIu64 " (%dx frame periods)",
 	     data->device_id, timeout_usec, data->timeout_frames);
 
 	if (v4l2_start_capture(data->dev, &data->buffers) < 0)
@@ -257,8 +269,19 @@ static void *v4l2_thread(void *vptr)
 		out.timestamp -= first_ts;
 
 		start = (uint8_t *)data->buffers.info[buf.index].start;
-		for (uint_fast32_t i = 0; i < MAX_AV_PLANES; ++i)
-			out.data[i] = start + plane_offsets[i];
+
+		if (data->pixfmt == V4L2_PIX_FMT_MJPEG ||
+		    data->pixfmt == V4L2_PIX_FMT_H264) {
+			if (v4l2_decode_frame(&out, start, buf.bytesused,
+					      &data->decoder) < 0) {
+				blog(LOG_ERROR,
+				     "failed to unpack jpeg or h264");
+				break;
+			}
+		} else {
+			for (uint_fast32_t i = 0; i < MAX_AV_PLANES; ++i)
+				out.data[i] = start + plane_offsets[i];
+		}
 		obs_source_output_video(data->source, &out);
 
 		if (v4l2_ioctl(data->dev, VIDIOC_QBUF, &buf) < 0) {
@@ -395,8 +418,14 @@ static void v4l2_device_list(obs_property_t *prop, obs_data_t *settings)
 
 		/* make sure device names are unique */
 		char unique_device_name[68];
-		sprintf(unique_device_name, "%s (%s)", video_cap.card,
-			video_cap.bus_info);
+		int ret = snprintf(unique_device_name,
+				   sizeof(unique_device_name), "%s (%s)",
+				   video_cap.card, video_cap.bus_info);
+		if (ret >= (int)sizeof(unique_device_name))
+			blog(LOG_DEBUG,
+			     "linux-v4l2: A format truncation may have occurred."
+			     " This can be ignored since it is quite improbable.");
+
 		obs_property_list_add_string(prop, unique_device_name,
 					     device.array);
 		blog(LOG_INFO, "Found device '%s' at %s", video_cap.card,
@@ -457,7 +486,9 @@ static void v4l2_format_list(int dev, obs_property_t *prop)
 			dstr_cat(&buffer, " (Emulated)");
 
 		if (v4l2_to_obs_video_format(fmt.pixelformat) !=
-		    VIDEO_FORMAT_NONE) {
+			    VIDEO_FORMAT_NONE ||
+		    fmt.pixelformat == V4L2_PIX_FMT_MJPEG ||
+		    fmt.pixelformat == V4L2_PIX_FMT_H264) {
 			obs_property_list_add_int(prop, buffer.array,
 						  fmt.pixelformat);
 			blog(LOG_INFO, "Pixelformat: %s (available)",
@@ -890,6 +921,10 @@ static void v4l2_terminate(struct v4l2_data *data)
 		data->thread = 0;
 	}
 
+	if (data->pixfmt == V4L2_PIX_FMT_MJPEG ||
+	    data->pixfmt == V4L2_PIX_FMT_H264) {
+		v4l2_destroy_decoder(&data->decoder);
+	}
 	v4l2_destroy_mmap(&data->buffers);
 
 	if (data->dev != -1) {
@@ -980,7 +1015,9 @@ static void v4l2_init(struct v4l2_data *data)
 		blog(LOG_ERROR, "Unable to set format");
 		goto fail;
 	}
-	if (v4l2_to_obs_video_format(data->pixfmt) == VIDEO_FORMAT_NONE) {
+	if (v4l2_to_obs_video_format(data->pixfmt) == VIDEO_FORMAT_NONE &&
+	    data->pixfmt != V4L2_PIX_FMT_MJPEG &&
+	    data->pixfmt != V4L2_PIX_FMT_H264) {
 		blog(LOG_ERROR, "Selected video format not supported");
 		goto fail;
 	}
@@ -994,6 +1031,11 @@ static void v4l2_init(struct v4l2_data *data)
 		blog(LOG_ERROR, "Unable to set framerate");
 		goto fail;
 	}
+	if (data->framerate == 0) {
+		blog(LOG_ERROR, "Framerate is not set, falling back to %i",
+		     FALLBACK_FRAMERATE);
+		data->framerate = v4l2_pack_tuple(1, FALLBACK_FRAMERATE);
+	}
 	v4l2_unpack_tuple(&fps_num, &fps_denom, data->framerate);
 	blog(LOG_INFO, "Framerate: %.2f fps", (float)fps_denom / fps_num);
 
@@ -1003,6 +1045,14 @@ static void v4l2_init(struct v4l2_data *data)
 		goto fail;
 	}
 
+	if (data->pixfmt == V4L2_PIX_FMT_MJPEG ||
+	    data->pixfmt == V4L2_PIX_FMT_H264) {
+		if (v4l2_init_decoder(&data->decoder, data->pixfmt) < 0) {
+			blog(LOG_ERROR, "Failed to initialize decoder");
+			goto fail;
+		}
+	}
+
 	/* start the capture thread */
 	if (os_event_init(&data->event, OS_EVENT_TYPE_MANUAL) != 0)
 		goto fail;
@@ -1010,7 +1060,7 @@ static void v4l2_init(struct v4l2_data *data)
 		goto fail;
 	return;
 fail:
-	blog(LOG_ERROR, "Initialization failed");
+	blog(LOG_ERROR, "Initialization failed, errno: %s", strerror(errno));
 	v4l2_terminate(data);
 }
 
@@ -1139,6 +1189,8 @@ static void *v4l2_create(obs_data_t *settings, obs_source_t *source)
 
 	signal_handler_connect(sh, "device_added", &device_added, data);
 	signal_handler_connect(sh, "device_removed", &device_removed, data);
+#else
+	blog(LOG_INFO, "Compiled without libudev, you can't reconnect devices");
 #endif
 
 	return data;

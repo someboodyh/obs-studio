@@ -186,7 +186,7 @@ mfxStatus dx9_simple_lock(mfxHDL pthis, mfxMemId mid, mfxFrameData *ptr)
 	if (FAILED(hr))
 		return MFX_ERR_LOCK_MEMORY;
 
-	switch ((DWORD)desc.Format) {
+	switch (desc.Format) {
 	case D3DFMT_NV12:
 		ptr->Pitch = (mfxU16)locked.Pitch;
 		ptr->Y = (mfxU8 *)locked.pBits;
@@ -402,6 +402,7 @@ mfxStatus _dx9_simple_alloc(mfxFrameAllocRequest *request,
 			new IDirect3DSurface9 *[request->NumFrameSuggested]);
 		if (!dxSrf.get()) {
 			MSDK_SAFE_FREE(dxMids);
+			MSDK_SAFE_FREE(dxMidPtrs);
 			return MFX_ERR_MEMORY_ALLOC;
 		}
 		hr = videoService->CreateSurface(
@@ -410,6 +411,7 @@ mfxStatus _dx9_simple_alloc(mfxFrameAllocRequest *request,
 			m_surfaceUsage, target, dxSrf.get(), NULL);
 		if (FAILED(hr)) {
 			MSDK_SAFE_FREE(dxMids);
+			MSDK_SAFE_FREE(dxMidPtrs);
 			return MFX_ERR_MEMORY_ALLOC;
 		}
 
