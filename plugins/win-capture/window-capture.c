@@ -583,7 +583,7 @@ static void wc_render(void *data, gs_effect_t *effect)
 {
 	struct window_capture *wc = data;
 	gs_effect_t *const base_effect =
-		obs_get_base_effect(wc->allow_transparency ? OBS_EFFECT_DEFAULT
+		obs_get_base_effect(wc->allow_transparency ? OBS_EFFECT_PREMULTIPLIED_ALPHA
 							   : OBS_EFFECT_OPAQUE);
 
 	if (wc->method == METHOD_WGC) {
