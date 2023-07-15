@@ -14,7 +14,6 @@
 
 /* clang-format off */
 
-
 #define TEXT_WINDOW_CAPTURE     obs_module_text("WindowCapture")
 #define TEXT_WINDOW             obs_module_text("WindowCapture.Window")
 #define TEXT_METHOD             obs_module_text("WindowCapture.Method")
@@ -29,7 +28,6 @@
 #define TEXT_COMPATIBILITY      obs_module_text("Compatibility")
 #define TEXT_CLIENT_AREA        obs_module_text("ClientArea")
 #define TEXT_ALLOW_TRANSPARENCY obs_module_text("AllowTransparency")
-
 
 /* clang-format on */
 
